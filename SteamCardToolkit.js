@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.6.1
+// @version      1.7.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -96,11 +96,16 @@
         /** 当前筛选：'card' | 'foil' | 'all' */
         filter: 'card',
         /**
-         * 是否启用「仅重复」：开启后每组只卖多余的（保留 1 张），
-         * 且没有重复的卡直接从列表隐藏。
+         * 是否启用「仅重复」：开启后每组只卖多余的，且没有多余的卡直接从列表隐藏。
          * 注意它和 filter 是两个独立维度 —— 前者管"卖多少"，后者管"看哪些"
          */
         repeatOnly: false,
+        /**
+         * 「仅重复」开启时每组保留几张（其余卖掉）。
+         * 例：某卡有 6 张、保留 4 张 → 列表显示 X2（要卖 2 张）。
+         * 所以开启后徽标显示的是"要卖几张"，而不是"共有几张"
+         */
+        keepCount: 1,
         /**
          * 上架定价规则：
          *   'lowest'  直接用市场最低价
@@ -1314,6 +1319,7 @@
 
             Panel.bindEvents();
             Panel.syncRuleInput();
+            Panel.syncKeepInput();
             Drag.bind(panel);
             // 位置恢复必须放在折叠 class 应用之后 —— 折叠态的宽度到那时才是最终值
             Drag.restore(panel);
@@ -1344,9 +1350,13 @@
                             <option value="foil">闪亮</option>
                             <option value="all">全部</option>
                         </select>
-                        <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
+                        <label class="scbs-repeat-toggle" title="只卖多余的。没有多余可卖的卡会从列表隐藏">
                             仅重复 <input type="checkbox" id="scbs-repeat-only">
                         </label>
+                        <span id="scbs-keep-wrap" class="scbs-keep-wrap" style="display:none">
+                            保留 <input type="number" id="scbs-keep-count" class="scbs-keep-input"
+                                      min="0" step="1" value="1"> 张
+                        </span>
                     </div>
 
                     <div class="scbs-rule-row">
@@ -1514,17 +1524,27 @@
                 }
 
                 state.repeatOnly = rep.checked;
+                Panel.syncKeepInput();
                 state.selected.clear();
 
                 // 按新规则重建选中集合
                 for (const g of state.groups) {
                     if (!selectedHashes.has(g.marketHashName)) continue;
-                    // 新规则下没有可卖的了（比如单张卡开着「仅重复」），自然落选
-                    if (state.repeatOnly && g.count < 2) continue;
+                    // 新规则下没有多余可卖的，自然落选
+                    if (state.repeatOnly && g.count <= state.keepCount) continue;
                     for (const id of Panel.targetAssetids(g)) state.selected.add(id);
                 }
 
                 Panel.renderList();
+            });
+
+            // 保留数量变化：同样要按新规则重算选中与列表
+            Panel.root.addEventListener('input', (ev) => {
+                const inp = ev.target.closest('#scbs-keep-count');
+                if (!inp) return;
+                const n = parseInt(inp.value, 10);
+                state.keepCount = (isNaN(n) || n < 0) ? 0 : n;
+                Panel.refreshAfterKeepChange();
             });
         },
 
@@ -1534,9 +1554,9 @@
             if (state.filter === 'foil') groups = groups.filter((g) => g.isFoil);
             else if (state.filter === 'card') groups = groups.filter((g) => !g.isFoil);
 
-            // 「仅重复」开启时把没有重复的卡直接隐藏 —— 留在列表里既不能勾选
-            // 也没信息量，只会干扰判断
-            if (state.repeatOnly) groups = groups.filter((g) => g.count >= 2);
+            // 「仅重复」开启时把"没有多余可卖"的卡直接隐藏 —— 留在列表里
+            // 既不能勾选也没信息量，只会干扰判断
+            if (state.repeatOnly) groups = groups.filter((g) => g.count > state.keepCount);
 
             return groups;
         },
@@ -1550,9 +1570,20 @@
          */
         targetAssetids(group) {
             if (state.repeatOnly) {
-                return group.assetids.slice(0, Math.max(group.count - 1, 0));
+                return group.assetids.slice(0, Math.max(group.count - state.keepCount, 0));
             }
             return group.assetids;
+        },
+
+        /**
+         * 该分组在列表里应该显示成几张。
+         * 开着「仅重复」时是"要卖的张数"（总数减保留数），否则就是库存张数。
+         * 例：6 张卡保留 4 张 → 显示 2
+         */
+        displayCount(group) {
+            return state.repeatOnly
+                ? Math.max(group.count - state.keepCount, 0)
+                : group.count;
         },
 
         /** 该分组的目标 asset 是否都已选中（分组勾选是原子的，不存在选一半的状态） */
@@ -1573,12 +1604,46 @@
             const el = document.getElementById('scbs-stats');
             if (!el) return;
             const groups = Panel.visibleGroups();
-            const totalCards = groups.reduce((sum, g) => sum + g.count, 0);
+            // 用 displayCount 而不是 count：开着仅重复时口径要与列表显示一致，
+            // 否则会出现"展示 3 种 / 12 张"但列表里只看到 4 张的错位
+            const totalCards = groups.reduce((sum, g) => sum + Panel.displayCount(g), 0);
             const sellable = groups.reduce((sum, g) => sum + Panel.targetAssetids(g).length, 0);
             // 三种口径都要给：种=多少类卡，张=库存共多少张，
             // 可卖=按当前规则实际会上架多少张（开着「仅重复」会比总数少）
             el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 可卖 ${sellable} 张` +
                              ` · 已选 ${state.selected.size} 张`;
+        },
+
+        /** 仅在勾选「仅重复」时显示保留数量输入框 */
+        syncKeepInput() {
+            const wrap = document.getElementById('scbs-keep-wrap');
+            if (!wrap) return;
+            wrap.style.display = state.repeatOnly ? 'flex' : 'none';
+        },
+
+        /**
+         * 「保留数量」变化后重算选中集合与列表。
+         *
+         * 为什么要连选中一起重算：保留数从 1 改成 4 时，原本选中的 X3 分组
+         * 已经变成"没有多余可卖"，那些 assetid 必须从已选里摘掉 ——
+         * 否则会留下"选了但列表里看不见"的幽灵条目，上架时才暴露。
+         */
+        refreshAfterKeepChange() {
+            const selectedHashes = new Set();
+            for (const g of state.groups) {
+                if (g.assetids.some((id) => state.selected.has(id))) {
+                    selectedHashes.add(g.marketHashName);
+                }
+            }
+
+            state.selected.clear();
+            for (const g of state.groups) {
+                if (!selectedHashes.has(g.marketHashName)) continue;
+                if (state.repeatOnly && g.count <= state.keepCount) continue;
+                for (const id of Panel.targetAssetids(g)) state.selected.add(id);
+            }
+
+            Panel.renderList();
         },
 
         /** 当前上架规则的可读描述，用于确认框与状态提示 */
@@ -1749,9 +1814,11 @@
                     : '';
                 // 价格单元格带 data-hash，供 updatePriceCells 做单行刷新时定位
                 const pending = PriceQueue.queued.has(g.marketHashName);
-                // 只有重复的才标数量：单张加个 X1 纯属噪音
-                const countBadge = g.count > 1
-                    ? `<span class="scbs-count">X${g.count}</span>`
+                // 徽标显示的是"要卖几张"：开着仅重复时是「总数 − 保留数」，
+                // 否则就是库存张数。为 1 时不加徽标（X1 是噪音）
+                const showCount = Panel.displayCount(g);
+                const countBadge = showCount > 1
+                    ? `<span class="scbs-count">X${showCount}</span>`
                     : '';
 
                 return `
@@ -2085,13 +2152,21 @@
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle {
                 display: flex; align-items: center; gap: 4px;
                 cursor: pointer; color: #8f98a0; white-space: nowrap;
-                flex-shrink: 0;
-                /* 紧接在下拉之后靠左，不再推到行尾；margin-right:auto
-                   保证整行内容左对齐而不是两端分散 */
-                margin-left: 12px;
-                margin-right: auto;
+                flex-shrink: 0; margin-left: 12px;
             }
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle:hover { color: #c7d5e0; }
+            /* 「保留 N 张」输入组，只在勾选仅重复时出现，紧跟在其右侧 */
+            #${CONFIG.PANEL_ID} .scbs-keep-wrap {
+                display: flex; align-items: center; gap: 3px;
+                color: #8f98a0; white-space: nowrap; flex-shrink: 0;
+            }
+            #${CONFIG.PANEL_ID} .scbs-keep-input {
+                width: 46px; box-sizing: border-box; text-align: center;
+                background: #16202d; color: #fff;
+                border: 1px solid #3d6c8d; border-radius: 2px;
+                padding: 4px; font-size: 12px;
+            }
+            #${CONFIG.PANEL_ID} .scbs-keep-input:focus { outline: none; border-color: #1a9fff; }
             /* 上架规则行：结构同筛选行，右侧按规则不同挂出输入框 */
             #${CONFIG.PANEL_ID} .scbs-rule-row {
                 display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
