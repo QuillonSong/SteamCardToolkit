@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.3.2
+// @version      1.4.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -170,6 +170,162 @@
     function writeCollapsedPref(collapsed) {
         try { localStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0'); } catch (e) { /* 写不进去不影响功能 */ }
     }
+
+    /**
+     * 面板位置的持久化。
+     *
+     * 为什么要分展开态和折叠态各记一份：两者宽度差一个数量级
+     * （420px vs 30px 上下），共用一份位置会导致切换形态时面板大幅跳位。
+     * 折叠态只记「贴哪一边 + 纵向位置」而不是绝对坐标 —— 这样窗口大小变化时
+     * 重新按边计算即可，不会因为存的是旧宽度下的 left 而跑到屏幕外。
+     */
+    const POS_KEY = 'scbs:pos';
+
+    function readPosPref() {
+        try {
+            const raw = localStorage.getItem(POS_KEY);
+            const obj = raw ? JSON.parse(raw) : null;
+            return (obj && typeof obj === 'object') ? obj : null;
+        } catch (e) { return null; }
+    }
+
+    function writePosPref(pref) {
+        try { localStorage.setItem(POS_KEY, JSON.stringify(pref)); } catch (e) { /* 同上 */ }
+    }
+
+    /** 纵向边界钳制：不允许把面板拖到视口外，否则就再也点不到了 */
+    function clampTop(top, height) {
+        const max = Math.max(0, window.innerHeight - height);
+        return Math.max(0, Math.min(top, max));
+    }
+
+    /**
+     * 面板拖动。
+     *
+     * 与"点击"的冲突：折叠态下整个标签是可点的（点开面板），现在又要能拖它。
+     * 用位移阈值区分 —— 按下后移动超过 4px 才算拖动，否则仍按点击处理。
+     */
+    const Drag = {
+        moved: false,
+        startX: 0,
+        startY: 0,
+        startLeft: 0,
+        startTop: 0,
+
+        bind(panel) {
+            const header = panel.querySelector('.scbs-header');
+            if (!header) return;
+            header.addEventListener('mousedown', (ev) => {
+                if (ev.button !== 0) return;   // 只认左键，中键右键不参与
+                Drag.begin(panel, ev);
+            });
+        },
+
+        begin(panel, ev) {
+            const rect = panel.getBoundingClientRect();
+            Drag.moved = false;
+            Drag.startX = ev.clientX;
+            Drag.startY = ev.clientY;
+            Drag.startLeft = rect.left;
+            Drag.startTop = rect.top;
+
+            // 拖动期间关掉过渡，否则面板会"追"着鼠标飘
+            panel.style.transition = 'none';
+            document.body.style.userSelect = 'none';
+
+            const onMove = (e) => Drag.onMove(panel, e);
+            const onUp = (e) => {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                Drag.end(panel);
+            };
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        },
+
+        onMove(panel, ev) {
+            const dx = ev.clientX - Drag.startX;
+            const dy = ev.clientY - Drag.startY;
+
+            // 位移不足阈值就还没进入拖动状态，这次按下最终会被当成点击
+            if (!Drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+            Drag.moved = true;
+
+            const w = panel.offsetWidth;
+            const h = panel.offsetHeight;
+            const left = Math.max(0, Math.min(Drag.startLeft + dx, window.innerWidth - w));
+            const top = Math.max(0, Math.min(Drag.startTop + dy, window.innerHeight - h));
+
+            Drag.apply(panel, left, top);
+        },
+
+        /** 用 inline style 定位。inline 优先级高于 class，能盖掉 CSS 里的 right */
+        apply(panel, left, top) {
+            panel.style.left = left + 'px';
+            panel.style.top = top + 'px';
+            panel.style.right = 'auto';
+        },
+
+        end(panel) {
+            if (!Drag.moved) {
+                // 没移动 —— 这是一次点击，交给 click 处理器去折叠/展开
+                panel.style.transition = '';
+                document.body.style.userSelect = '';
+                return;
+            }
+
+            const collapsed = panel.classList.contains('scbs-collapsed');
+            const pref = readPosPref() || {};
+            const rect = panel.getBoundingClientRect();
+
+            if (collapsed) {
+                // 折叠态吸附到最近的边缘。
+                // 按标签中心相对视口中心判断，而不是按鼠标落点 ——
+                // 用户的意图是"把它搁到哪边"，中心点比落点更贴合直觉
+                const centerX = rect.left + rect.width / 2;
+                const side = centerX < window.innerWidth / 2 ? 'left' : 'right';
+                const top = clampTop(rect.top, panel.offsetHeight);
+
+                pref.collapsed = { side, top };
+                panel.style.transition = 'left .18s ease-out, top .18s ease-out';
+                Drag.apply(panel, side === 'left' ? 0 : window.innerWidth - rect.width, top);
+            } else {
+                pref.expanded = { left: rect.left, top: rect.top };
+            }
+
+            writePosPref(pref);
+            document.body.style.userSelect = '';
+
+            // 过渡用完就撤，否则之后每次改尺寸都会带上动画
+            setTimeout(() => { panel.style.transition = ''; }, 220);
+
+            // moved 的复位移到下一轮事件循环。
+            // click 是紧跟着 mouseup 同步派发的，所以这里不能立刻清 ——
+            // 清了就挡不住"拖动完顺手折叠"的误触。
+            // 但也不能一直留着：留到下回点折叠按钮时才清，那一次点击正好会被误吞。
+            // 放到下一轮，正好落在 click 之后。
+            setTimeout(() => { Drag.moved = false; }, 0);
+        },
+
+        /**
+         * 按持久化的记录恢复位置。在面板挂载、且折叠 class 已应用之后调用，
+         * 因为折叠态的宽度要到那时才是最终值
+         */
+        restore(panel) {
+            const pref = readPosPref();
+            if (!pref) return;
+
+            if (panel.classList.contains('scbs-collapsed')) {
+                if (!pref.collapsed) return;
+                const top = clampTop(pref.collapsed.top, panel.offsetHeight);
+                Drag.apply(panel, pref.collapsed.side === 'left' ? 0 : window.innerWidth - panel.offsetWidth, top);
+            } else if (pref.expanded) {
+                const left = Math.max(0, Math.min(pref.expanded.left, window.innerWidth - panel.offsetWidth));
+                const top = clampTop(pref.expanded.top, panel.offsetHeight);
+                Drag.apply(panel, left, top);
+            }
+        },
+    };
 
     /** 取当前页面的 g_sessionID，写操作必须带 */
     function getSessionId() {
@@ -908,6 +1064,12 @@
             }
 
             Panel.bindEvents();
+            Drag.bind(panel);
+            // 位置恢复必须放在折叠 class 应用之后 —— 折叠态的宽度到那时才是最终值
+            Drag.restore(panel);
+
+            // 窗口尺寸变化后原来的坐标可能已经越界，重新钳制一次
+            window.addEventListener('resize', () => Panel.relayout());
         },
 
         template() {
@@ -968,6 +1130,9 @@
 
                 switch (action) {
                     case 'toggle': {
+                        // 刚拖动过就不要顺手把面板折叠了 —— 那次按下是为了移动，不是切换形态
+                        if (Drag.moved) { Drag.moved = false; return; }
+
                         const collapsed = Panel.root.classList.contains('scbs-collapsed');
                         // 展开态下只认右侧那个折叠按钮 —— 否则用户想点面板空白处时会误收；
                         // 收成小标签后整个标签任意位置都可点 —— 标签本来就只有一条，不必精准命中
@@ -976,6 +1141,8 @@
                         const next = !collapsed;
                         Panel.root.classList.toggle('scbs-collapsed', next);
                         writeCollapsedPref(next);
+                        // 形态变了宽度也变，位置必须跟着重算
+                        Panel.relayout();
                         break;
                     }
                     case 'load':
@@ -1119,6 +1286,35 @@
             // 可卖=按当前规则实际会上架多少张（开着「仅重复」会比总数少）
             el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 可卖 ${sellable} 张` +
                              ` · 已选 ${state.selected.size} 张`;
+        },
+
+        /**
+         * 形态切换或视口变化后重算位置。
+         *
+         * 两种形态宽度差一个数量级，沿用切换前的 left 很可能把面板推出视口；
+         * 窗口缩小时同理 —— 原本贴右边的坐标会落到可视区之外。
+         */
+        relayout() {
+            const panel = Panel.root;
+            if (!panel) return;
+
+            const pref = readPosPref() || {};
+            const rect = panel.getBoundingClientRect();
+
+            if (panel.classList.contains('scbs-collapsed')) {
+                // 小标签：贴边。优先用记录里的边，没有就按当前横向位置判断
+                const side = pref.collapsed
+                    ? pref.collapsed.side
+                    : (rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right');
+                const top = clampTop(rect.top, panel.offsetHeight);
+                Drag.apply(panel, side === 'left' ? 0 : window.innerWidth - panel.offsetWidth, top);
+            } else {
+                // 展开态：用记录的位置，没有记录就把当前横向位置钳制进可视区
+                const left = pref.expanded ? pref.expanded.left : rect.left;
+                Drag.apply(panel,
+                    Math.max(0, Math.min(left, window.innerWidth - panel.offsetWidth)),
+                    clampTop(rect.top, panel.offsetHeight));
+            }
         },
 
         /**
