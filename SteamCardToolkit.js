@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.4.1
+// @version      1.5.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -633,6 +633,14 @@
                     name: desc.name,
                     type: desc.type,
                     iconUrl: desc.icon_url,
+                    /**
+                     * 这张卡属于哪个游戏（Steam 的 market_fee_app）。
+                     * 批量取价要按它分组 —— /market/search/render/ 支持按游戏过滤，
+                     * 一次请求能带回该游戏下多张卡的价格
+                     */
+                    gameAppid: desc.market_fee_app != null
+                        ? String(desc.market_fee_app)
+                        : String(desc.market_hash_name).split('-')[0],
                     /** 是否可上架。不可上架的直接不展示，避免用户选中后必然失败 */
                     marketable: desc.marketable === 1,
                     /** 是否集换式卡牌 */
@@ -668,6 +676,8 @@
                     type: it.type,
                     iconUrl: it.iconUrl,
                     isFoil: it.isFoil,
+                    /** 批量取价时用来把卡按游戏归组 */
+                    gameAppid: it.gameAppid,
                     /** 该分组下的全部 asset 实例。上架时逐个发请求 */
                     assetids: [],
                     count: 0,
@@ -813,8 +823,84 @@
      *   - 点「查询底价」（全量补空缺）
      *   - 停止之后再次启动
      */
+    /**
+     * 市场搜索接口 —— 按游戏批量取价。
+     *
+     * 为什么需要它：priceoverview 只能逐张查，240 个卡名就要 240 次请求，
+     * 而且实测它独享一个限流池 —— 一旦被限流整个查价就停摆。
+     *
+     * 关键实测结论：/market/search/render/ 与 priceoverview 【互相独立】——
+     * priceoverview 返回 429 的同一时刻，这个接口仍然返回 200。
+     * 所以它可以作为批量取价的主通道，priceoverview 退居精确补漏。
+     *
+     * 参数要点（实测确认，非官方文档）：
+     *   norender=1                                    让端点返回 JSON 而非 HTML
+     *   category_753_item_class[]=tag_item_class_2     限定为集换式卡牌
+     *   category_753_Game[]=tag_app_<AppID>            按游戏过滤
+     *   start / count                                  【count 参数无效】，每页固定 10 条
+     *
+     * 返回字段：hash_name / sell_price（整数分）/ sell_price_text / app_name / ...
+     */
+    const SearchAPI = {
+        PAGE_SIZE: 10,
+        /** 单个游戏最多翻多少页就放弃。正常游戏十几张卡，2 页足够 */
+        MAX_PAGES: 12,
+
+        async fetchPage(gameAppid, page) {
+            const url = '/market/search/render/?norender=1&appid=' + CONFIG.APPID +
+                        '&start=' + (page * SearchAPI.PAGE_SIZE) +
+                        '&count=' + SearchAPI.PAGE_SIZE +
+                        '&category_753_item_class%5B%5D=tag_item_class_2' +
+                        '&category_753_Game%5B%5D=tag_app_' + encodeURIComponent(gameAppid);
+
+            const resp = await fetch(url, { credentials: 'include' });
+            if (resp.status === 429) throw new Error('RATE_LIMITED');
+            if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+            const data = await resp.json();
+            return (data && data.results) || [];
+        },
+
+        /**
+         * 拉取某个游戏下所有卡牌的价格，只保留 wanted 里需要的卡名。
+         *
+         * 为什么可以提前收工：翻页途中一旦把 wanted 全部找齐就停，
+         * 不必把后面的页翻完 —— 实测多数游戏 1~2 页就够。
+         *
+         * @param {string} gameAppid
+         * @param {Set<string>} wanted market_hash_name 集合
+         * @returns {Promise<Map<string, number>>} hash_name -> 最低价（分）
+         */
+        async fetchGame(gameAppid, wanted) {
+            const got = new Map();
+
+            for (let page = 0; page < SearchAPI.MAX_PAGES; page++) {
+                const results = await SearchAPI.fetchPage(gameAppid, page);
+                if (!results.length) break;
+
+                for (const r of results) {
+                    if (!r.hash_name || !wanted.has(r.hash_name)) continue;
+                    if (got.has(r.hash_name)) continue;
+                    // sell_price 缺失表示该卡当前无挂单，跳过即可
+                    if (typeof r.sell_price === 'number' && r.sell_price > 0) {
+                        got.set(r.hash_name, r.sell_price);
+                    }
+                }
+
+                if (got.size >= wanted.size) break;
+                if (page < SearchAPI.MAX_PAGES - 1) await sleep(CONFIG.PRICE_QUERY_INTERVAL);
+            }
+
+            return got;
+        },
+    };
+
     const PriceQueue = {
-        /** 待查卡名（FIFO） */
+        /**
+         * 待处理任务（FIFO）。元素是任务对象而非裸卡名，因为有两条取价通道：
+         *   { type: 'item', name }               单张，走 priceoverview（快，勾选时用）
+         *   { type: 'game', appid, hashes: Set } 一批同游戏的卡，走 search/render（省请求，全量用）
+         */
         pending: [],
         /** 已在待查队列中的卡名，用于去重 */
         queued: new Set(),
@@ -840,7 +926,7 @@
             }
 
             this.queued.add(name);
-            this.pending.push(name);
+            this.pending.push({ type: 'item', name });
             return true;
         },
 
@@ -865,8 +951,20 @@
         remove(name) {
             if (!this.queued.has(name)) return;
             this.queued.delete(name);
-            const i = this.pending.indexOf(name);
-            if (i >= 0) this.pending.splice(i, 1);
+
+            for (let i = 0; i < this.pending.length; i++) {
+                const task = this.pending[i];
+                if (task.type === 'item' && task.name === name) {
+                    this.pending.splice(i, 1);
+                    return;
+                }
+                // 游戏批次：只摘掉这一个卡名；整批都空了才把任务一起撤掉
+                if (task.type === 'game' && task.hashes.has(name)) {
+                    task.hashes.delete(name);
+                    if (!task.hashes.size) this.pending.splice(i, 1);
+                    return;
+                }
+            }
         },
 
         /** 清空待查队列（不影响已查到的结果） */
@@ -889,48 +987,56 @@
             this.run();
         },
 
-        /** worker 主体：串行取队列，逐条查询 */
+        /**
+         * 按游戏批量入队（全量查询走这条）。
+         *
+         * 为什么全量查询不逐张入队：240 个卡名逐张查要 240 次请求，
+         * 而按游戏分组后每个游戏只需 1~2 页就连带拿回该游戏所有卡的价格。
+         *
+         * @param {Array} groups 分组列表（state.groups）
+         * @returns {number} 实际纳入的卡名数
+         */
+        enqueueGames(groups) {
+            const byGame = new Map();
+
+            for (const g of groups) {
+                const name = g.marketHashName;
+                if (this.queued.has(name)) continue;
+
+                // 已有新鲜价格就跳过，避免为同一张卡反复发请求
+                const cached = state.priceCache.get(name);
+                if (cached && Date.now() - cached.ts < CONFIG.PRICE_CACHE_TTL) continue;
+
+                const appid = g.gameAppid || String(name).split('-')[0];
+                if (!byGame.has(appid)) byGame.set(appid, new Set());
+                byGame.get(appid).add(name);
+                this.queued.add(name);
+            }
+
+            let n = 0;
+            for (const [appid, hashes] of byGame) {
+                this.pending.push({ type: 'game', appid, hashes });
+                n += hashes.size;
+            }
+            if (n > 0) this.start();
+            return n;
+        },
+
+        /** worker 主体：串行取队列，按任务类型分派 */
         async run() {
             const persist = new Map();
 
             while (this.pending.length && !this.stopRequested) {
-                const name = this.pending.shift();
-                this.queued.delete(name);
+                const task = this.pending.shift();
 
-                // 三态语义，必须分清，否则缓存会固化错误：
-                //   {…}        查到价格
-                //   null       接口正常返回，确实没有挂单
-                //   undefined  请求失败或被限流 —— 结果未知，绝不写入任何缓存
-                let data;
-                let certain = false;
-                let failKind = null;
-                try {
-                    data = await PriceAPI.queryLowest(name);
-                    certain = true;
-                } catch (e) {
-                    data = undefined;
-                    failKind = (e.message === 'RATE_LIMITED') ? 'limit' : 'error';
-                    if (failKind === 'limit') {
-                        UI.warn(`"${name}" 被限流（429），本轮未取到价格`);
-                    } else {
-                        UI.warn(`"${name}" 查询失败：${e.message}`);
-                    }
-                }
-
-                if (certain) {
-                    const entry = { data, ts: Date.now() };
-                    state.priceCache.set(name, entry);
-                    persist.set(name, entry);
-                    // 这次拿到了结果，之前记录的失败状态作废
-                    state.priceErrors.delete(name);
+                if (task.type === 'game') {
+                    for (const h of task.hashes) this.queued.delete(h);
+                    await this.runGameTask(task, persist);
                 } else {
-                    state.priceErrors.set(name, failKind);
+                    this.queued.delete(task.name);
+                    await this.runItemTask(task.name, persist);
                 }
 
-                // 每查完一条立刻更新对应行的显示。
-                // 这里刻意不重建整个列表 —— 313 行 innerHTML 重建的开销，
-                // 在逐条刷新时会累积成肉眼可见的卡顿
-                Panel.updatePriceCells(name);
                 Panel.reportQueue();
 
                 // 分批落盘，避免每查一条就把整张缓存表序列化一遍
@@ -951,6 +1057,87 @@
             this.running = false;
             this.stopRequested = false;
             Panel.onQueueDrained();
+        },
+
+        /**
+         * 单张查询：走 priceoverview。勾选某张卡时用这条 —— 一次请求约一秒出价。
+         *
+         * 三态语义，必须分清，否则缓存会固化错误：
+         *   {…}        查到价格
+         *   null       接口正常返回，确实没有挂单
+         *   undefined  请求失败或被限流 —— 结果未知，绝不写入任何缓存
+         */
+        async runItemTask(name, persist) {
+            let data;
+            let certain = false;
+            let failKind = null;
+            try {
+                data = await PriceAPI.queryLowest(name);
+                certain = true;
+            } catch (e) {
+                data = undefined;
+                failKind = (e.message === 'RATE_LIMITED') ? 'limit' : 'error';
+                if (failKind === 'limit') {
+                    UI.warn(`"${name}" 被限流（429），本轮未取到价格`);
+                } else {
+                    UI.warn(`"${name}" 查询失败：${e.message}`);
+                }
+            }
+
+            if (certain) {
+                const entry = { data, ts: Date.now() };
+                state.priceCache.set(name, entry);
+                persist.set(name, entry);
+                // 这次拿到了结果，之前记录的失败状态作废
+                state.priceErrors.delete(name);
+            } else {
+                state.priceErrors.set(name, failKind);
+            }
+
+            // 每查完一条立刻刷新那一行。刻意不重建整个列表 ——
+            // 313 行 innerHTML 重建的开销在逐条刷新时会累积成肉眼可见的卡顿
+            Panel.updatePriceCells(name);
+        },
+
+        /**
+         * 批量查询：一个游戏一次，走 search/render。
+         *
+         * 拿到的卡算出售家实收写入缓存；没拿到的标记为 'missing' ——
+         * 它表示"该游戏市场里没有这张卡的挂单"，是确定结论而非失败，
+         * 因此可以像"无挂单"一样展示，但不能当成查询错误。
+         */
+        async runGameTask(task, persist) {
+            let got;
+            try {
+                got = await SearchAPI.fetchGame(task.appid, task.hashes);
+            } catch (e) {
+                // 整批失败：绝不能给任何卡写"无挂单"，那会是错误结论。
+                // 只标失败原因，留着后续补漏或下轮重试
+                const kind = (e.message === 'RATE_LIMITED') ? 'limit' : 'error';
+                for (const h of task.hashes) state.priceErrors.set(h, kind);
+                UI.warn(`游戏 ${task.appid} 批量取价失败：${e.message}`);
+                for (const h of task.hashes) Panel.updatePriceCells(h);
+                return;
+            }
+
+            for (const h of task.hashes) {
+                const lowest = got.get(h);
+                if (typeof lowest === 'number' && lowest > 0) {
+                    const entry = {
+                        data: {
+                            lowestCents: lowest,
+                            sellerReceivesCents: Fee.getItemPriceFromTotal(lowest),
+                        },
+                        ts: Date.now(),
+                    };
+                    state.priceCache.set(h, entry);
+                    persist.set(h, entry);
+                    state.priceErrors.delete(h);
+                } else {
+                    state.priceErrors.set(h, 'missing');
+                }
+                Panel.updatePriceCells(h);
+            }
         },
     };
 
@@ -1364,6 +1551,11 @@
             if (err === 'error') {
                 return '<span class="scbs-error" title="请求失败">失败</span>';
             }
+            // 'missing' 是确定结论（该游戏的市场里没有这张卡的挂单），
+            // 与"无挂单"同义，不能当作错误展示
+            if (err === 'missing') {
+                return '<span class="scbs-noprice">无挂单</span>';
+            }
             return '<span class="scbs-noprice">—</span>';
         },
 
@@ -1512,31 +1704,31 @@
                 return;
             }
 
-            // 只补空缺：已有新鲜底价的卡不重查（用户确认过的默认行为）
-            const names = [...new Set(state.items
-                .filter((it) => it.marketable && it.isCard)
-                .map((it) => it.marketHashName))];
-
-            if (!names.length) {
+            if (!state.groups.length) {
                 Panel.setStatus('没有可查询的卡牌', 'error');
                 return;
             }
 
-            const added = PriceQueue.enqueueMany(names);
+            // 全量查询走"按游戏批量"通道：一个游戏 1~2 页就能连带取回该游戏
+            // 所有卡的价格，比逐张查省得多；而且这条通道不受 priceoverview 限流影响
+            const added = PriceQueue.enqueueGames(state.groups);
             if (!added) {
-                Panel.setStatus(`没有需要补查的卡（${names.length} 个卡名都已有底价）`, 'ok');
+                Panel.setStatus(`没有需要补查的卡（${state.groups.length} 个卡名都已有底价）`, 'ok');
                 Panel.updatePriceButton();
                 return;
             }
 
             Panel.updatePriceButton();
-            Panel.setStatus(`已入队 ${added} 个卡名，开始查询…`);
+            Panel.setStatus(`已按游戏分批入队，共 ${added} 个卡名，开始查询…`);
         },
 
         /** 队列每推进一步时的状态反馈 */
         reportQueue() {
             if (!PriceQueue.running) return;
-            Panel.setStatus(`查询中… 队列剩余 ${PriceQueue.pending.length} 个`);
+            // pending 里装的是任务而不是卡名，要展开才知道还剩多少张
+            const remaining = PriceQueue.pending.reduce(
+                (sum, t) => sum + (t.type === 'game' ? t.hashes.size : 1), 0);
+            Panel.setStatus(`查询中… 剩余 ${remaining} 张`);
             Panel.updatePriceButton();
         },
 
