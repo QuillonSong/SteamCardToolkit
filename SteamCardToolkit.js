@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.7.0
+// @version      1.7.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -1339,7 +1339,7 @@
                 </div>
                 <div class="scbs-body">
                     <div class="scbs-toolbar">
-                        <button data-action="load" class="scbs-btn scbs-btn-primary">加载库存</button>
+                        <button data-action="load" class="scbs-btn scbs-btn-primary">刷新库存</button>
                         <button data-action="prices" class="scbs-btn" id="scbs-price-btn">查询底价</button>
                     </div>
 
@@ -1801,7 +1801,7 @@
             if (!groups.length) {
                 listEl.innerHTML = state.loaded
                     ? '<div class="scbs-empty">当前筛选下没有可上架的卡牌</div>'
-                    : '<div class="scbs-empty">点击"加载库存"开始</div>';
+                    : '<div class="scbs-empty">正在读取库存…</div>';
                 Panel.updateStats();
                 return;
             }
@@ -2272,8 +2272,11 @@
 
         injectStyle();
         Panel.mount();
-        UI.log('已就绪。面板在右上角，先点"加载库存"。' +
-               (warmed ? `已从本地缓存预热 ${warmed} 个卡价。` : ''));
+        UI.log('已就绪。' + (warmed ? `已从本地缓存预热 ${warmed} 个卡价。` : ''));
+
+        // 挂载后自动刷一次库存 —— 打开页面就能看到卡牌列表，不必再手动点一下。
+        // 这里不 await：初始化不该被网络请求阻塞，失败也只在状态栏提示
+        Panel.onLoad();
     }
 
     // document-idle 时 DOM 已就绪，直接初始化即可
