@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.6.0
+// @version      1.6.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -11,6 +11,8 @@
 // @downloadURL  https://raw.githubusercontent.com/QuillonSong/SteamCardToolkit/main/SteamCardToolkit.js
 // @match        https://steamcommunity.com/id/*/inventory*
 // @match        https://steamcommunity.com/profiles/*/inventory*
+// @match        https://steamcommunity.com/market/*
+// @match        https://steamcommunity.com/market/
 // @run-at       document-idle
 // @grant        none
 // ==/UserScript==
@@ -2172,9 +2174,16 @@
     // ========================================================================
 
     function initialize() {
-        // 只在库存页挂载。虽然 @match 已限定，但 Steam 有 SPA 式跳转的可能，多做一道判断
-        const isInventoryPage = /\/inventory/.test(location.pathname);
-        if (!isInventoryPage) return;
+        // 库存页和市场页都挂载。
+        //
+        // 市场页原本没在支持范围内，但实测它同样具备 g_steamID / g_sessionID /
+        // g_rgWalletInfo，而库存数据是走接口拉的、不依赖页面上下文，
+        // 所以没有理由不让人在这儿用 —— 浏览市场时想顺手清一下库存是常见场景。
+        //
+        // 这道判断仍然保留：Steam 有 SPA 式跳转的可能，@match 未必拦得住所有路径
+        const p = location.pathname;
+        const isSupportedPage = /\/inventory/.test(p) || /^\/market(\/|$)/.test(p);
+        if (!isSupportedPage) return;
 
         // 把上次会话查到的价格预热进内存缓存，这样列表一渲染就能看到上次的结果。
         // 注意：预热进来的条目在"查询价格"时仍会按内存 TTL 判断是否重新查询，
