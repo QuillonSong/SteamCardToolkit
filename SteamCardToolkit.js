@@ -4,7 +4,7 @@
 // @version      1.0.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
-// @license      MIT
+// @license      GPL-3.0-only
 // @homepageURL  https://github.com/QuillonSong/SteamCardToolkit
 // @supportURL   https://github.com/QuillonSong/SteamCardToolkit/issues
 // @updateURL    https://raw.githubusercontent.com/QuillonSong/SteamCardToolkit/main/SteamCardToolkit.js
