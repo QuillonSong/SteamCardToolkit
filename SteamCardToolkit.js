@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.1.0
+// @version      1.2.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -570,80 +570,153 @@
             PriceCacheStore.write(stored);
         },
 
+    };
+
+    /**
+     * 底价查询队列。
+     *
+     * 为什么要队列，而不是原来那种"点一次跑一批"：
+     *   1. 单张要能立刻出结果 —— 队列里只有它时就是直通，没有额外排队延迟；
+     *   2. 连勾多张时又要削峰 —— 同时发多个请求会撞 429（实测 4 个并发就被限流）；
+     *   3. 全程可中断 —— 全量 260 张要约 6.5 分钟，查到够用往往就想停。
+     *
+     * 三种来源都进这同一个队列，从而保证任何时候同一个卡名只会有一个在途请求：
+     *   - 勾选某张卡
+     *   - 点「查询底价」（全量补空缺）
+     *   - 停止之后再次启动
+     */
+    const PriceQueue = {
+        /** 待查卡名（FIFO） */
+        pending: [],
+        /** 已在待查队列中的卡名，用于去重 */
+        queued: new Set(),
+        /** worker 是否在跑 */
+        running: false,
+        /** 用户是否请求过停止。worker 会在当前这条查完后退出 */
+        stopRequested: false,
+
         /**
-         * 批量查询，按 market_hash_name 去重后串行查询。
-         *
-         * 为什么去重：同游戏的重复卡会共享 market_hash_name，去重能省掉这些重复请求。
-         * 但实测 313 张卡去重后仍有 260 个卡名（卡牌基本每张都是独立卡名），
-         * 所以去重收益有限 —— 真正的提速要靠持久缓存复用上次的结果。
-         *
-         * 为什么串行不并发：priceoverview 有限流，并发容易触发 429 甚至临时封禁。
-         * 慢是可以接受的，被封是灾难性的。
-         *
-         * @param {Array<string>} names 去重后的卡名列表
-         * @param {Function} onProgress (done, total, currentName) => void
+         * 单个卡名入队。
+         * @param {string} name market_hash_name
+         * @param {Object} [opts] { force: true } 时忽略缓存强制重查
+         * @returns {boolean} 是否真的入队了
          */
-        async queryBatch(names, onProgress) {
-            const results = new Map();
-            // 本轮查到的确定结果，攒够一批再落盘
+        enqueue(name, opts) {
+            if (!name) return false;
+            if (this.queued.has(name)) return false;
+
+            // 已有新鲜价格就跳过，避免为同一张卡反复发请求
+            if (!(opts && opts.force)) {
+                const cached = state.priceCache.get(name);
+                if (cached && Date.now() - cached.ts < CONFIG.PRICE_CACHE_TTL) return false;
+            }
+
+            this.queued.add(name);
+            this.pending.push(name);
+            return true;
+        },
+
+        /**
+         * 批量入队并启动 worker。
+         * @returns {number} 实际入队数量（已被价格覆盖的不计）
+         */
+        enqueueMany(names, opts) {
+            let added = 0;
+            for (const name of names) {
+                if (this.enqueue(name, opts)) added++;
+            }
+            if (added > 0) this.start();
+            return added;
+        },
+
+        /**
+         * 把某个卡名移出待查队列。
+         * 用户取消勾选时调用 —— 既然不打算卖它，就没必要为它花一次请求。
+         * 已经查到的价格不会动，下次再勾选会直接显示。
+         */
+        remove(name) {
+            if (!this.queued.has(name)) return;
+            this.queued.delete(name);
+            const i = this.pending.indexOf(name);
+            if (i >= 0) this.pending.splice(i, 1);
+        },
+
+        /** 清空待查队列（不影响已查到的结果） */
+        clear() {
+            this.pending.length = 0;
+            this.queued.clear();
+        },
+
+        /** 请求停止：清空队列，worker 会在当前这条查完后退出 */
+        requestStop() {
+            this.stopRequested = true;
+            this.clear();
+        },
+
+        /** 启动 worker。已在跑则什么都不做 */
+        start() {
+            if (this.running) return;
+            this.stopRequested = false;
+            this.running = true;
+            this.run();
+        },
+
+        /** worker 主体：串行取队列，逐条查询 */
+        async run() {
             const persist = new Map();
 
-            for (let i = 0; i < names.length; i++) {
-                const name = names[i];
-
-                // 命中未过期缓存则跳过网络请求。
-                // 时间在循环内取，而不是循环外取一次 —— 整轮可能跑好几分钟，
-                // 用循环开始的时间戳判断会让"新鲜度"越到后面越失真
-                const cached = state.priceCache.get(name);
-                if (cached && Date.now() - cached.ts < CONFIG.PRICE_CACHE_TTL) {
-                    results.set(name, cached.data);
-                    if (onProgress) onProgress(i + 1, names.length, name);
-                    continue;
-                }
+            while (this.pending.length && !this.stopRequested) {
+                const name = this.pending.shift();
+                this.queued.delete(name);
 
                 // 三态语义，必须分清，否则缓存会固化错误：
                 //   {…}        查到价格
                 //   null       接口正常返回，确实没有挂单
                 //   undefined  请求失败或被限流 —— 结果未知，绝不写入任何缓存
                 let data;
-                let certain;
+                let certain = false;
                 try {
                     data = await PriceAPI.queryLowest(name);
                     certain = true;
                 } catch (e) {
                     data = undefined;
-                    certain = false;
                     if (e.message === 'RATE_LIMITED') {
-                        UI.warn(`查询 "${name}" 被限流（429），本轮未取到价格`);
+                        UI.warn(`"${name}" 被限流（429），本轮未取到价格`);
                     } else {
-                        UI.warn(`查询 "${name}" 失败：${e.message}`);
+                        UI.warn(`"${name}" 查询失败：${e.message}`);
                     }
                 }
 
-                // 只有确定的结果才进缓存。未知结果若也写进去，
-                // 会话内后续重复查询会一直拿到这个假结果
                 if (certain) {
                     const entry = { data, ts: Date.now() };
                     state.priceCache.set(name, entry);
                     persist.set(name, entry);
                 }
-                results.set(name, data);
 
-                if (onProgress) onProgress(i + 1, names.length, name);
+                // 每查完一条立刻更新对应行的显示。
+                // 这里刻意不重建整个列表 —— 313 行 innerHTML 重建的开销，
+                // 在逐条刷新时会累积成肉眼可见的卡顿
+                Panel.updatePriceCells(name);
+                Panel.reportQueue();
 
                 // 分批落盘，避免每查一条就把整张缓存表序列化一遍
-                if (persist.size && i % CONFIG.PRICE_CACHE_FLUSH_EVERY === 0) {
+                if (persist.size >= CONFIG.PRICE_CACHE_FLUSH_EVERY) {
                     PriceAPI.flushPersist(persist);
+                    persist.clear();
                 }
 
-                // 最后一个之后不再等待，省掉一次无谓的 delay
-                if (i < names.length - 1) await sleep(CONFIG.PRICE_QUERY_INTERVAL);
+                // 队列空了或用户要求停止时不再等待，立刻退出
+                if (this.pending.length && !this.stopRequested) {
+                    await sleep(CONFIG.PRICE_QUERY_INTERVAL);
+                }
             }
 
-            // 收尾再落盘一次，把最后不足一批的条目也写进去
+            // 收尾落盘，把最后不足一批的条目也写进去
             if (persist.size) PriceAPI.flushPersist(persist);
 
-            return results;
+            this.running = false;
+            this.stopRequested = false;
+            Panel.onQueueDrained();
         },
     };
 
@@ -791,7 +864,7 @@
                 <div class="scbs-body">
                     <div class="scbs-toolbar">
                         <button data-action="load" class="scbs-btn scbs-btn-primary">加载库存</button>
-                        <button data-action="prices" class="scbs-btn">查询价格</button>
+                        <button data-action="prices" class="scbs-btn" id="scbs-price-btn">查询底价</button>
                     </div>
 
                     <div class="scbs-filters">
@@ -843,7 +916,7 @@
                         await Panel.onLoad();
                         break;
                     case 'prices':
-                        await Panel.onQueryPrices();
+                        Panel.onTogglePriceScan();
                         break;
                     case 'select-all':
                         Panel.bulkSelect(true);
@@ -866,10 +939,19 @@
                 const cb = ev.target.closest('input[data-assetid]');
                 if (!cb) return;
                 const assetid = cb.getAttribute('data-assetid');
+                const item = state.items.find((it) => it.assetid === assetid);
+                if (!item) return;
+
                 if (cb.checked) {
                     state.selected.add(assetid);
+                    // 勾选即入队查底价。队列里只有它时是直通处理，
+                    // 所以体验是"勾上后约一秒出价"，而不是排在别人后面等
+                    PriceQueue.enqueueMany([item.marketHashName]);
                 } else {
                     state.selected.delete(assetid);
+                    // 不卖了就没必要为它花一次请求。
+                    // 已经查到的价格保留 —— 万一又勾回来，不必重查
+                    PriceQueue.remove(item.marketHashName);
                 }
                 Panel.updateStats();
             });
@@ -905,6 +987,46 @@
             el.textContent = `展示 ${visible.length} 项 / 已选 ${selCount} 项`;
         },
 
+        /**
+         * 生成价格单元格的 HTML。
+         * @param {string} marketHashName
+         * @param {boolean} [pending] 该卡当前是否排在待查队列里
+         */
+        priceCellHtml(marketHashName, pending) {
+            if (pending) {
+                return '<span class="scbs-pending">查询中…</span>';
+            }
+            const price = state.priceCache.get(marketHashName);
+            if (price && price.data) {
+                return `<span class="scbs-lowest">${escapeHtml(Fee.formatCents(price.data.lowestCents))}</span>` +
+                       `<span class="scbs-receive">到手 ${escapeHtml(Fee.formatCents(price.data.sellerReceivesCents))}</span>`;
+            }
+            if (price) {
+                // 缓存里有这条记录但 data 是 null —— 接口明确答复过"没有挂单"
+                return '<span class="scbs-noprice">无挂单</span>';
+            }
+            return '<span class="scbs-noprice">—</span>';
+        },
+
+        /**
+         * 只刷新指定卡名的价格单元格，不重建整个列表。
+         *
+         * 为什么不用属性选择器（.scbs-price[data-hash="..."]）：
+         * 卡名里含括号、空格、单引号等字符，拼进选择器必须转义，很容易出错；
+         * 直接遍历比较 dataset 更稳，而 313 行的遍历开销远小于重建整表 innerHTML。
+         */
+        updatePriceCells(marketHashName) {
+            const listEl = document.getElementById('scbs-list');
+            if (!listEl) return;
+            const cells = listEl.querySelectorAll('.scbs-price');
+            const html = Panel.priceCellHtml(marketHashName, false);
+            for (const cell of cells) {
+                if (cell.dataset.hash === marketHashName) {
+                    cell.innerHTML = html;
+                }
+            }
+        },
+
         renderList() {
             const listEl = document.getElementById('scbs-list');
             if (!listEl) return;
@@ -921,19 +1043,11 @@
             // 一次性拼字符串再赋值，避免几百次 DOM 插入造成卡顿
             const html = visible.map((item) => {
                 const checked = state.selected.has(item.assetid) ? 'checked' : '';
-                const price = state.priceCache.get(item.marketHashName);
-                let priceText = '<span class="scbs-noprice">—</span>';
-                if (price && price.data) {
-                    priceText =
-                        `<span class="scbs-lowest">${escapeHtml(Fee.formatCents(price.data.lowestCents))}</span>` +
-                        `<span class="scbs-receive">到手 ${escapeHtml(Fee.formatCents(price.data.sellerReceivesCents))}</span>`;
-                } else if (price) {
-                    priceText = '<span class="scbs-noprice">无挂单</span>';
-                }
-
                 const icon = item.iconUrl
                     ? `https://community.cloudflare.steamstatic.com/economy/image/${item.iconUrl}/64fx64f`
                     : '';
+                // 价格单元格带 data-hash，供 updatePriceCells 做单行刷新时定位
+                const pending = PriceQueue.queued.has(item.marketHashName);
 
                 return `
                     <div class="scbs-row${item.isFoil ? ' scbs-foil' : ''}">
@@ -943,7 +1057,7 @@
                             <div class="scbs-name" title="${escapeHtml(item.marketHashName)}">${escapeHtml(item.name)}</div>
                             <div class="scbs-type">${item.isFoil ? '闪卡' : '普通卡'} · ${escapeHtml(item.type)}</div>
                         </div>
-                        <div class="scbs-price">${priceText}</div>
+                        <div class="scbs-price" data-hash="${escapeHtml(item.marketHashName)}">${Panel.priceCellHtml(item.marketHashName, pending)}</div>
                     </div>
                 `;
             }).join('');
@@ -1010,39 +1124,70 @@
             }
         },
 
-        /** 查询价格 */
-        async onQueryPrices() {
+        /**
+         * 「查询底价 / 停止查询」二合一按钮的处理。
+         *
+         * 为什么合成一个按钮：这两个动作是同一个状态的两面 —— 要么待机、要么在扫。
+         * 拆成两个按钮会出现"扫描进行中还能再点一次扫描"这种无意义的状态。
+         */
+        onTogglePriceScan() {
+            if (PriceQueue.running) {
+                PriceQueue.requestStop();
+                // 这里不直接报"已停止"：worker 可能还在查当前那一条，
+                // 等它退出后由 onQueueDrained 给出准确的收尾状态
+                Panel.setStatus('正在停止…');
+                return;
+            }
+
             if (!state.loaded) {
                 Panel.setStatus('请先加载库存', 'error');
                 return;
             }
 
-            // 去重：同名的卡只需查一次
+            // 只补空缺：已有新鲜底价的卡不重查（用户确认过的默认行为）
             const names = [...new Set(state.items
                 .filter((it) => it.marketable && it.isCard)
                 .map((it) => it.marketHashName))];
 
             if (!names.length) {
-                Panel.setStatus('没有需要查询的卡牌', 'error');
+                Panel.setStatus('没有可查询的卡牌', 'error');
                 return;
             }
 
-            state.busy = true;
-            const started = Date.now();
-            try {
-                await PriceAPI.queryBatch(names, (done, totalCount, name) => {
-                    Panel.setStatus(`查询价格 ${done}/${totalCount}：${name}`);
-                });
-                Panel.renderList();
-
-                const secs = ((Date.now() - started) / 1000).toFixed(1);
-                Panel.setStatus(`价格查询完成，共 ${names.length} 个卡名，耗时 ${secs}s`, 'ok');
-            } catch (e) {
-                UI.error('查询价格失败', e);
-                Panel.setStatus('查询失败：' + e.message, 'error');
-            } finally {
-                state.busy = false;
+            const added = PriceQueue.enqueueMany(names);
+            if (!added) {
+                Panel.setStatus(`没有需要补查的卡（${names.length} 个卡名都已有底价）`, 'ok');
+                Panel.updatePriceButton();
+                return;
             }
+
+            Panel.updatePriceButton();
+            Panel.setStatus(`已入队 ${added} 个卡名，开始查询…`);
+        },
+
+        /** 队列每推进一步时的状态反馈 */
+        reportQueue() {
+            if (!PriceQueue.running) return;
+            Panel.setStatus(`查询中… 队列剩余 ${PriceQueue.pending.length} 个`);
+            Panel.updatePriceButton();
+        },
+
+        /** 队列结束（自然跑完或用户停止）后的收尾 */
+        onQueueDrained() {
+            const priced = Panel.visibleItems().filter((it) => {
+                const p = state.priceCache.get(it.marketHashName);
+                return p && p.data;
+            }).length;
+            Panel.setStatus(`查询结束，当前 ${priced} 项有底价`, 'ok');
+            Panel.updatePriceButton();
+        },
+
+        /** 按钮文案随队列状态切换 */
+        updatePriceButton() {
+            const btn = document.getElementById('scbs-price-btn');
+            if (!btn) return;
+            btn.textContent = PriceQueue.running ? '停止查询' : '查询底价';
+            btn.classList.toggle('scbs-btn-active', PriceQueue.running);
         },
 
         /** 批量上架 */
@@ -1182,6 +1327,8 @@
                 padding: 5px 10px; cursor: pointer; font-size: 12px;
             }
             #${CONFIG.PANEL_ID} .scbs-btn:hover { background: #3d6c8d; color: #fff; }
+            /* 查询进行中的按钮态。用橙色区别于红色的"批量上架"，避免误认成危险操作 */
+            #${CONFIG.PANEL_ID} .scbs-btn-active { background: #c47a2b; color: #fff; }
             #${CONFIG.PANEL_ID} .scbs-btn-primary { background: #1a9fff; color: #fff; }
             #${CONFIG.PANEL_ID} .scbs-btn-danger { background: #a74c3c; color: #fff; flex: 1; }
             #${CONFIG.PANEL_ID} .scbs-btn-sm { padding: 3px 8px; }
@@ -1209,6 +1356,7 @@
             #${CONFIG.PANEL_ID} .scbs-lowest { display: block; color: #beee11; }
             #${CONFIG.PANEL_ID} .scbs-receive { display: block; color: #8f98a0; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-noprice { color: #6b7680; }
+            #${CONFIG.PANEL_ID} .scbs-pending { color: #f0a94c; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-empty { padding: 20px; text-align: center; color: #8f98a0; }
             #${CONFIG.PANEL_ID} .scbs-footer { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
             #${CONFIG.PANEL_ID} .scbs-status { flex: 1; color: #8f98a0; word-break: break-all; }
