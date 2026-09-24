@@ -88,9 +88,21 @@
         // 批量高频调用有触发风控的风险，因此比查价更保守
         SELL_INTERVAL: 1200,
 
-        // 价格缓存有效期（毫秒）。同一 market_hash_name 的卡在有效期内只查一次，
-        // 这是把 300+ 次查询压到 100 次左右的关键优化
+        // 内存中价格缓存的有效期（毫秒）。同一次会话内，同一 market_hash_name
+        // 在这个时间内只查一次，避免重复请求
         PRICE_CACHE_TTL: 5 * 60 * 1000,
+
+        // 持久化价格缓存的有效期（毫秒）。存进 localStorage，让"下次打开页面"
+        // 也能复用上次查到的价格，不必重新等一轮。
+        // 取 2 小时是折中：低价卡价格短期内相当稳定，但也不该拿太旧的数据做决策
+        PRICE_CACHE_PERSIST_TTL: 2 * 60 * 60 * 1000,
+
+        // localStorage 中存放价格缓存的键名
+        PRICE_CACHE_KEY: 'scbs:pricecache',
+
+        // 每查多少条把持久缓存落盘一次。
+        // 逐条写会在 260 次 JSON 序列化上白费时间，完全拖到最后写又会在中途关页面时丢光结果
+        PRICE_CACHE_FLUSH_EVERY: 20,
 
         // 每次上架操作最多发起多少笔，发满后停下等用户去手机确认。
         // 设成 0 表示不限制。默认小批量是为了避免一次堆出上百条待确认把人埋了
@@ -491,6 +503,54 @@
     // 六、价格 API
     // ========================================================================
 
+    /**
+     * 价格缓存的持久化。
+     *
+     * 为什么要持久化：260 个卡名按限速要查约 6.5 分钟，而这个结果在几小时内基本有效。
+     * 缓存下来能让"下次打开页面"直接可用，省掉一整轮等待。
+     *
+     * 为什么只存确定的结果：见 queryBatch 里的三态说明 —— 若把"请求失败/被限流"
+     * 也一并存进来，一个瞬时的 429 会让那张卡在接下来两小时里都显示成"无挂单"，
+     * 而用户完全看不出来。
+     */
+    const PriceCacheStore = {
+        /** 读取持久缓存，返回 { name: { data, ts } }。任何异常都退化为空表 */
+        read() {
+            try {
+                const raw = localStorage.getItem(CONFIG.PRICE_CACHE_KEY);
+                if (!raw) return {};
+                const obj = JSON.parse(raw);
+                if (!obj || typeof obj !== 'object') return {};
+
+                // 顺手丢弃过期条目，避免这份缓存无限膨胀
+                const now = Date.now();
+                const alive = {};
+                for (const key in obj) {
+                    const entry = obj[key];
+                    if (entry && typeof entry.ts === 'number' &&
+                        now - entry.ts < CONFIG.PRICE_CACHE_PERSIST_TTL) {
+                        alive[key] = entry;
+                    }
+                }
+                return alive;
+            } catch (e) {
+                // 隐私模式、配额满、数据被改坏 —— 都只是拿不到缓存，不该影响主流程
+                return {};
+            }
+        },
+
+        /** 写入持久缓存。写失败（配额满等）静默忽略 */
+        write(map) {
+            try {
+                localStorage.setItem(CONFIG.PRICE_CACHE_KEY, JSON.stringify(map));
+                return true;
+            } catch (e) {
+                UI.warn('价格缓存写入失败（可能是 localStorage 配额不足）：' + e.message);
+                return false;
+            }
+        },
+    };
+
     const PriceAPI = {
         /**
          * 查询单个 market_hash_name 的市场最低价。
@@ -514,13 +574,21 @@
                         '&market_hash_name=' + encodeURIComponent(marketHashName);
 
             const resp = await fetch(url, { credentials: 'include' });
+
+            // 429 必须单独识别。它是"被限流"，不是"该物品没有报价" ——
+            // 两者混在一起，会让限流期间的卡被误标成"无挂单"，
+            // 而且一旦这种错误结果进入缓存，它会在整个缓存有效期内持续误导用户
+            if (resp.status === 429) {
+                throw new Error('RATE_LIMITED');
+            }
             if (!resp.ok) {
                 throw new Error(`HTTP ${resp.status}`);
             }
             const data = await resp.json();
 
             if (!data || !data.lowest_price) {
-                // 无挂单，或该物品不可交易
+                // 这是"确认无挂单"（接口正常返回，只是没有 lowest_price 字段），
+                // 与上面的请求失败是两回事：这个是确定结果，可以缓存
                 return null;
             }
 
@@ -540,10 +608,23 @@
         },
 
         /**
+         * 把本轮查到的确定结果合并进持久缓存并落盘。
+         * 必须先读再合并 —— 直接覆盖会把上一次会话查到的、其它卡的价格全冲掉。
+         */
+        flushPersist(persist) {
+            const stored = PriceCacheStore.read();
+            for (const [name, entry] of persist) {
+                stored[name] = entry;
+            }
+            PriceCacheStore.write(stored);
+        },
+
+        /**
          * 批量查询，按 market_hash_name 去重后串行查询。
          *
-         * 为什么去重：314 张可上架卡实际只有约 100 个不同的卡名
-         * （同游戏同名的卡会重复出现），去重能把查询次数压到三分之一。
+         * 为什么去重：同游戏的重复卡会共享 market_hash_name，去重能省掉这些重复请求。
+         * 但实测 313 张卡去重后仍有 260 个卡名（卡牌基本每张都是独立卡名），
+         * 所以去重收益有限 —— 真正的提速要靠持久缓存复用上次的结果。
          *
          * 为什么串行不并发：priceoverview 有限流，并发容易触发 429 甚至临时封禁。
          * 慢是可以接受的，被封是灾难性的。
@@ -553,35 +634,63 @@
          */
         async queryBatch(names, onProgress) {
             const results = new Map();
-            const now = Date.now();
+            // 本轮查到的确定结果，攒够一批再落盘
+            const persist = new Map();
 
             for (let i = 0; i < names.length; i++) {
                 const name = names[i];
 
-                // 命中未过期缓存则跳过网络请求
+                // 命中未过期缓存则跳过网络请求。
+                // 时间在循环内取，而不是循环外取一次 —— 整轮可能跑好几分钟，
+                // 用循环开始的时间戳判断会让"新鲜度"越到后面越失真
                 const cached = state.priceCache.get(name);
-                if (cached && now - cached.ts < CONFIG.PRICE_CACHE_TTL) {
+                if (cached && Date.now() - cached.ts < CONFIG.PRICE_CACHE_TTL) {
                     results.set(name, cached.data);
                     if (onProgress) onProgress(i + 1, names.length, name);
                     continue;
                 }
 
-                let data = null;
+                // 三态语义，必须分清，否则缓存会固化错误：
+                //   {…}        查到价格
+                //   null       接口正常返回，确实没有挂单
+                //   undefined  请求失败或被限流 —— 结果未知，绝不写入任何缓存
+                let data;
+                let certain;
                 try {
                     data = await PriceAPI.queryLowest(name);
+                    certain = true;
                 } catch (e) {
-                    UI.warn(`查询 "${name}" 失败：${e.message}`);
+                    data = undefined;
+                    certain = false;
+                    if (e.message === 'RATE_LIMITED') {
+                        UI.warn(`查询 "${name}" 被限流（429），本轮未取到价格`);
+                    } else {
+                        UI.warn(`查询 "${name}" 失败：${e.message}`);
+                    }
                 }
 
-                // 失败也写入缓存（值为 null），避免反复重试同一个坏请求
-                state.priceCache.set(name, { data, ts: Date.now() });
+                // 只有确定的结果才进缓存。未知结果若也写进去，
+                // 会话内后续重复查询会一直拿到这个假结果
+                if (certain) {
+                    const entry = { data, ts: Date.now() };
+                    state.priceCache.set(name, entry);
+                    persist.set(name, entry);
+                }
                 results.set(name, data);
 
                 if (onProgress) onProgress(i + 1, names.length, name);
 
+                // 分批落盘，避免每查一条就把整张缓存表序列化一遍
+                if (persist.size && i % CONFIG.PRICE_CACHE_FLUSH_EVERY === 0) {
+                    PriceAPI.flushPersist(persist);
+                }
+
                 // 最后一个之后不再等待，省掉一次无谓的 delay
                 if (i < names.length - 1) await sleep(CONFIG.PRICE_QUERY_INTERVAL);
             }
+
+            // 收尾再落盘一次，把最后不足一批的条目也写进去
+            if (persist.size) PriceAPI.flushPersist(persist);
 
             return results;
         },
@@ -1167,9 +1276,20 @@
         const isInventoryPage = /\/inventory/.test(location.pathname);
         if (!isInventoryPage) return;
 
+        // 把上次会话查到的价格预热进内存缓存，这样列表一渲染就能看到上次的结果。
+        // 注意：预热进来的条目在"查询价格"时仍会按内存 TTL 判断是否重新查询，
+        // 所以点一次查询就会把过期的旧价刷新掉，不会一直用旧数据
+        const stored = PriceCacheStore.read();
+        let warmed = 0;
+        for (const name in stored) {
+            state.priceCache.set(name, stored[name]);
+            warmed++;
+        }
+
         injectStyle();
         Panel.mount();
-        UI.log('已就绪。面板在右上角，先点"加载库存"。');
+        UI.log('已就绪。面板在右上角，先点"加载库存"。' +
+               (warmed ? `已从本地缓存预热 ${warmed} 个卡价。` : ''));
     }
 
     // document-idle 时 DOM 已就绪，直接初始化即可
