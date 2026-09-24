@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.3.1
+// @version      1.3.2
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -926,11 +926,14 @@
                     </div>
 
                     <div class="scbs-filters">
-                        <select id="scbs-filter-select">
-                            <option value="card" selected>普通卡片</option>
-                            <option value="foil">闪卡</option>
-                            <option value="all">全部</option>
-                        </select>
+                        <div class="scbs-filter-row">
+                            <label for="scbs-filter-select">卡牌边框：</label>
+                            <select id="scbs-filter-select">
+                                <option value="card" selected>普通</option>
+                                <option value="foil">闪亮</option>
+                                <option value="all">全部</option>
+                            </select>
+                        </div>
                         <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
                             <input type="checkbox" id="scbs-repeat-only"> 仅重复（留 1 张，卖多余）
                         </label>
@@ -1480,8 +1483,13 @@
             #${CONFIG.PANEL_ID} .scbs-toolbar,
             #${CONFIG.PANEL_ID} .scbs-actions { display: flex; gap: 6px; margin-bottom: 6px; }
             #${CONFIG.PANEL_ID} .scbs-filters { margin-bottom: 6px; }
+            /* 标签与下拉同一行：标签不收缩，下拉吃掉剩余宽度 */
+            #${CONFIG.PANEL_ID} .scbs-filter-row { display: flex; align-items: center; gap: 6px; }
+            #${CONFIG.PANEL_ID} .scbs-filter-row label {
+                color: #8f98a0; white-space: nowrap; flex-shrink: 0;
+            }
             #${CONFIG.PANEL_ID} #scbs-filter-select {
-                width: 100%; box-sizing: border-box;
+                flex: 1; box-sizing: border-box; min-width: 0;
                 background: #2a475e; color: #c7d5e0;
                 border: 1px solid #3d6c8d; border-radius: 2px;
                 padding: 4px 6px; font-size: 12px; cursor: pointer;
