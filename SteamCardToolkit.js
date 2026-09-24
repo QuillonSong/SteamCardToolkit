@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.3.0
+// @version      1.3.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -91,8 +91,14 @@
         loaded: false,
         /** 是否有耗时任务在跑，用于互斥，防止用户连点造成并发请求风暴 */
         busy: false,
-        /** 当前筛选：'card' | 'foil' | 'all' | 'dup' */
+        /** 当前筛选：'card' | 'foil' | 'all' */
         filter: 'card',
+        /**
+         * 是否启用「仅重复」：开启后每组只卖多余的（保留 1 张），
+         * 且没有重复的卡直接从列表隐藏。
+         * 注意它和 filter 是两个独立维度 —— 前者管"卖多少"，后者管"看哪些"
+         */
+        repeatOnly: false,
     };
 
     // ========================================================================
@@ -924,8 +930,10 @@
                             <option value="card" selected>普通卡片</option>
                             <option value="foil">闪卡</option>
                             <option value="all">全部</option>
-                            <option value="dup">仅重复</option>
                         </select>
+                        <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
+                            <input type="checkbox" id="scbs-repeat-only"> 仅重复（留 1 张，卖多余）
+                        </label>
                     </div>
 
                     <div class="scbs-stats" id="scbs-stats">尚未加载</div>
@@ -997,10 +1005,14 @@
                 const group = state.groups.find((g) => g.marketHashName === hash);
                 if (!group) return;
 
+                // 用 targetAssetids 而不是 assetids：开着「仅重复」时，
+                // 一个 X5 的分组只该选中 4 个（保留 1 张）
+                const targets = Panel.targetAssetids(group);
+
                 if (cb.checked) {
                     // 整组一起选。Steam 的上架接口是单个 asset 的，
                     // 所以勾一个 X3 分组等于把 3 个 asset 全部标为待上架
-                    for (const id of group.assetids) state.selected.add(id);
+                    for (const id of targets) state.selected.add(id);
                     // 勾选即入队查底价。队列里只有它时是直通处理，
                     // 所以体验是"勾上后约一秒出价"，而不是排在别人后面等
                     PriceQueue.enqueueMany([hash]);
@@ -1008,7 +1020,7 @@
                     // 查询已经开始，会以为这个功能不存在
                     Panel.updatePriceCells(hash);
                 } else {
-                    for (const id of group.assetids) state.selected.delete(id);
+                    for (const id of targets) state.selected.delete(id);
                     // 不卖了就没必要为它花一次请求。
                     // 已经查到的价格保留 —— 万一又勾回来，不必重查
                     PriceQueue.remove(hash);
@@ -1022,20 +1034,69 @@
                 state.filter = sel.value;
                 Panel.renderList();
             });
+
+            // 「仅重复」开关。
+            // 切换时必须按新规则重算已选内容 —— 否则一个已经勾好的 X5 分组，
+            // 会在开关打开后仍然选着 5 张，与"只卖 4 张"的预期不符
+            Panel.root.addEventListener('change', (ev) => {
+                const rep = ev.target.closest('#scbs-repeat-only');
+                if (!rep) return;
+
+                // 先记下哪些分组当前处于选中状态，再切规则
+                const selectedHashes = new Set();
+                for (const g of state.groups) {
+                    if (g.assetids.some((id) => state.selected.has(id))) {
+                        selectedHashes.add(g.marketHashName);
+                    }
+                }
+
+                state.repeatOnly = rep.checked;
+                state.selected.clear();
+
+                // 按新规则重建选中集合
+                for (const g of state.groups) {
+                    if (!selectedHashes.has(g.marketHashName)) continue;
+                    // 新规则下没有可卖的了（比如单张卡开着「仅重复」），自然落选
+                    if (state.repeatOnly && g.count < 2) continue;
+                    for (const id of Panel.targetAssetids(g)) state.selected.add(id);
+                }
+
+                Panel.renderList();
+            });
         },
 
         /** 按当前筛选条件取出要展示的分组 */
         visibleGroups() {
-            const groups = state.groups;
-            if (state.filter === 'foil') return groups.filter((g) => g.isFoil);
-            if (state.filter === 'card') return groups.filter((g) => !g.isFoil);
-            if (state.filter === 'dup') return groups.filter((g) => g.count >= 2);
+            let groups = state.groups;
+            if (state.filter === 'foil') groups = groups.filter((g) => g.isFoil);
+            else if (state.filter === 'card') groups = groups.filter((g) => !g.isFoil);
+
+            // 「仅重复」开启时把没有重复的卡直接隐藏 —— 留在列表里既不能勾选
+            // 也没信息量，只会干扰判断
+            if (state.repeatOnly) groups = groups.filter((g) => g.count >= 2);
+
             return groups;
         },
 
-        /** 该分组是否已被完全选中（分组勾选是原子的，不存在选一半的状态） */
+        /**
+         * 该分组实际要卖哪几个 asset。
+         *
+         * 「仅重复」开启时保留 1 张、卖掉其余 —— 这正是它与"筛掉单张卡"的
+         * 区别所在：它不是筛选条件，而是决定每组卖几张。
+         * 例：一张 X5 的卡，开着开关勾选只会选中 4 个 asset。
+         */
+        targetAssetids(group) {
+            if (state.repeatOnly) {
+                return group.assetids.slice(0, Math.max(group.count - 1, 0));
+            }
+            return group.assetids;
+        },
+
+        /** 该分组的目标 asset 是否都已选中（分组勾选是原子的，不存在选一半的状态） */
         isGroupSelected(group) {
-            return group.assetids.every((id) => state.selected.has(id));
+            const targets = Panel.targetAssetids(group);
+            if (!targets.length) return false;
+            return targets.every((id) => state.selected.has(id));
         },
 
         setStatus(text, kind) {
@@ -1050,8 +1111,11 @@
             if (!el) return;
             const groups = Panel.visibleGroups();
             const totalCards = groups.reduce((sum, g) => sum + g.count, 0);
-            // 同时给出"种"和"张"：合并显示后单看条目数会严重低估实际要卖的量
-            el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 已选 ${state.selected.size} 张`;
+            const sellable = groups.reduce((sum, g) => sum + Panel.targetAssetids(g).length, 0);
+            // 三种口径都要给：种=多少类卡，张=库存共多少张，
+            // 可卖=按当前规则实际会上架多少张（开着「仅重复」会比总数少）
+            el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 可卖 ${sellable} 张` +
+                             ` · 已选 ${state.selected.size} 张`;
         },
 
         /**
@@ -1158,7 +1222,7 @@
                 // 反选以"整组"为单位判断：否则 X3 的分组会被拆成"选 1 张留 2 张"的
                 // 中间态，而这个界面刻意不支持部分选中
                 const fullySelected = Panel.isGroupSelected(g);
-                for (const id of g.assetids) {
+                for (const id of Panel.targetAssetids(g)) {
                     if (value === null) {
                         if (fullySelected) state.selected.delete(id);
                         else state.selected.add(id);
@@ -1423,6 +1487,11 @@
                 padding: 4px 6px; font-size: 12px; cursor: pointer;
             }
             #${CONFIG.PANEL_ID} #scbs-filter-select:hover { background: #3d6c8d; color: #fff; }
+            #${CONFIG.PANEL_ID} .scbs-repeat-toggle {
+                display: flex; align-items: center; gap: 6px;
+                margin-top: 5px; cursor: pointer; color: #8f98a0;
+            }
+            #${CONFIG.PANEL_ID} .scbs-repeat-toggle:hover { color: #c7d5e0; }
             #${CONFIG.PANEL_ID} .scbs-btn {
                 background: #2a475e; color: #c7d5e0; border: none; border-radius: 2px;
                 padding: 5px 10px; cursor: pointer; font-size: 12px;
