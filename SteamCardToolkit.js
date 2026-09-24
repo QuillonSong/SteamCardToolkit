@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.5.0
+// @version      1.5.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -1295,16 +1295,14 @@
                     </div>
 
                     <div class="scbs-filters">
-                        <div class="scbs-filter-row">
-                            <label for="scbs-filter-select">卡牌边框：</label>
-                            <select id="scbs-filter-select">
-                                <option value="card" selected>普通</option>
-                                <option value="foil">闪亮</option>
-                                <option value="all">全部</option>
-                            </select>
-                        </div>
+                        <label for="scbs-filter-select">卡牌边框：</label>
+                        <select id="scbs-filter-select">
+                            <option value="card" selected>普通</option>
+                            <option value="foil">闪亮</option>
+                            <option value="all">全部</option>
+                        </select>
                         <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
-                            <input type="checkbox" id="scbs-repeat-only"> 仅重复（留 1 张，卖多余）
+                            <input type="checkbox" id="scbs-repeat-only"> 仅重复
                         </label>
                     </div>
 
@@ -1314,6 +1312,8 @@
                         <button data-action="select-all" class="scbs-btn scbs-btn-sm">全选</button>
                         <button data-action="select-none" class="scbs-btn scbs-btn-sm">清空</button>
                         <button data-action="select-invert" class="scbs-btn scbs-btn-sm">反选</button>
+                        <button data-action="select-priced" class="scbs-btn scbs-btn-sm"
+                                title="勾选所有已经查到最低价的卡">底价</button>
                     </div>
 
                     <div class="scbs-list" id="scbs-list"></div>
@@ -1368,6 +1368,13 @@
                     case 'select-invert':
                         Panel.bulkSelect(null);
                         break;
+                    case 'select-priced': {
+                        const n = Panel.selectPriced();
+                        Panel.setStatus(n
+                            ? `已勾选 ${n} 张有底价的卡`
+                            : '当前筛选下没有已查到价格的卡');
+                        break;
+                    }
                     case 'sell':
                         await Panel.onSell();
                         break;
@@ -1628,6 +1635,30 @@
          * 批量勾选。
          * @param {boolean|null} value true=全选 false=清空 null=反选
          */
+        /**
+         * 勾选所有"已经查到最低价"的卡。
+         *
+         * 为什么需要它：查完价后往往只想卖那些确实有人挂单的卡（有价才有得卖），
+         * 逐个手点太慢。这里只做【追加】勾选、不取消已有的 ——
+         * 免得在已经挑好的选择上误操作；想反向筛选可以先点「清空」再点这个。
+         *
+         * @returns {number} 本次新勾选的张数（按 asset 计，重复卡按实际张数算）
+         */
+        selectPriced() {
+            let added = 0;
+            for (const g of Panel.visibleGroups()) {
+                const p = state.priceCache.get(g.marketHashName);
+                if (!p || !p.data) continue;             // 没有底价，跳过
+                if (Panel.isGroupSelected(g)) continue;  // 已经选过了，不重复计
+
+                const targets = Panel.targetAssetids(g);
+                for (const id of targets) state.selected.add(id);
+                added += targets.length;
+            }
+            Panel.renderList();
+            return added;
+        },
+
         bulkSelect(value) {
             for (const g of Panel.visibleGroups()) {
                 // 反选以"整组"为单位判断：否则 X3 的分组会被拆成"选 1 张留 2 张"的
@@ -1890,22 +1921,25 @@
             #${CONFIG.PANEL_ID} .scbs-body { padding: 8px 10px; display: flex; flex-direction: column; overflow: hidden; }
             #${CONFIG.PANEL_ID} .scbs-toolbar,
             #${CONFIG.PANEL_ID} .scbs-actions { display: flex; gap: 6px; margin-bottom: 6px; }
-            #${CONFIG.PANEL_ID} .scbs-filters { margin-bottom: 6px; }
-            /* 标签与下拉同一行：标签不收缩，下拉吃掉剩余宽度 */
-            #${CONFIG.PANEL_ID} .scbs-filter-row { display: flex; align-items: center; gap: 6px; }
-            #${CONFIG.PANEL_ID} .scbs-filter-row label {
+            /* 标签、下拉、仅重复三者排在同一行。
+               下拉给固定窄宽度，把横向空间让出来，避免"仅重复"被挤到下一行 */
+            #${CONFIG.PANEL_ID} .scbs-filters {
+                display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+            }
+            #${CONFIG.PANEL_ID} .scbs-filters > label {
                 color: #8f98a0; white-space: nowrap; flex-shrink: 0;
             }
             #${CONFIG.PANEL_ID} #scbs-filter-select {
-                flex: 1; box-sizing: border-box; min-width: 0;
+                flex: 0 0 auto; width: 76px; box-sizing: border-box;
                 background: #2a475e; color: #c7d5e0;
                 border: 1px solid #3d6c8d; border-radius: 2px;
                 padding: 4px 6px; font-size: 12px; cursor: pointer;
             }
             #${CONFIG.PANEL_ID} #scbs-filter-select:hover { background: #3d6c8d; color: #fff; }
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle {
-                display: flex; align-items: center; gap: 6px;
-                margin-top: 5px; cursor: pointer; color: #8f98a0;
+                display: flex; align-items: center; gap: 4px;
+                cursor: pointer; color: #8f98a0; white-space: nowrap;
+                flex-shrink: 0; margin-left: auto;
             }
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle:hover { color: #c7d5e0; }
             #${CONFIG.PANEL_ID} .scbs-btn {
