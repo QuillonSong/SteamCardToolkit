@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.7.2
-// @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
+// @version      1.7.3
+// @description  API 直读库存与市场价，按底价 / 固定附加 / 百分比附加批量上架集换式卡牌，可只卖重复卡（生效需手机端确认）
 // @author       Quillon
 // @license      GPL-3.0-only
 // @homepageURL  https://github.com/QuillonSong/SteamCardToolkit
