@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.4.0
+// @version      1.4.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -193,9 +193,29 @@
         try { localStorage.setItem(POS_KEY, JSON.stringify(pref)); } catch (e) { /* 同上 */ }
     }
 
+    /**
+     * 视口可用宽高（不含滚动条）。
+     *
+     * 这里刻意不用 window.innerWidth —— 它把垂直滚动条的宽度也算在视口内，
+     * 拿它算"贴右边缘"会让面板右缘落在滚动条底下，被遮住十几像素。
+     * documentElement.clientWidth 才是真正能放内容的宽度。
+     *
+     * 同理也不用它作兜底：本文件其余位置的视口计算已全部改为调用这两个函数，
+     * 若在此处写 window.innerWidth，全局替换后会变成对自身的调用。
+     */
+    function viewportWidth() {
+        const d = document.documentElement;
+        return d.clientWidth || (document.body && document.body.clientWidth) || 0;
+    }
+
+    function viewportHeight() {
+        const d = document.documentElement;
+        return d.clientHeight || (document.body && document.body.clientHeight) || 0;
+    }
+
     /** 纵向边界钳制：不允许把面板拖到视口外，否则就再也点不到了 */
     function clampTop(top, height) {
-        const max = Math.max(0, window.innerHeight - height);
+        const max = Math.max(0, viewportHeight() - height);
         return Math.max(0, Math.min(top, max));
     }
 
@@ -253,8 +273,8 @@
 
             const w = panel.offsetWidth;
             const h = panel.offsetHeight;
-            const left = Math.max(0, Math.min(Drag.startLeft + dx, window.innerWidth - w));
-            const top = Math.max(0, Math.min(Drag.startTop + dy, window.innerHeight - h));
+            const left = Math.max(0, Math.min(Drag.startLeft + dx, viewportWidth() - w));
+            const top = Math.max(0, Math.min(Drag.startTop + dy, viewportHeight() - h));
 
             Drag.apply(panel, left, top);
         },
@@ -283,12 +303,12 @@
                 // 按标签中心相对视口中心判断，而不是按鼠标落点 ——
                 // 用户的意图是"把它搁到哪边"，中心点比落点更贴合直觉
                 const centerX = rect.left + rect.width / 2;
-                const side = centerX < window.innerWidth / 2 ? 'left' : 'right';
+                const side = centerX < viewportWidth() / 2 ? 'left' : 'right';
                 const top = clampTop(rect.top, panel.offsetHeight);
 
                 pref.collapsed = { side, top };
                 panel.style.transition = 'left .18s ease-out, top .18s ease-out';
-                Drag.apply(panel, side === 'left' ? 0 : window.innerWidth - rect.width, top);
+                Drag.apply(panel, side === 'left' ? 0 : viewportWidth() - rect.width, top);
             } else {
                 pref.expanded = { left: rect.left, top: rect.top };
             }
@@ -318,9 +338,9 @@
             if (panel.classList.contains('scbs-collapsed')) {
                 if (!pref.collapsed) return;
                 const top = clampTop(pref.collapsed.top, panel.offsetHeight);
-                Drag.apply(panel, pref.collapsed.side === 'left' ? 0 : window.innerWidth - panel.offsetWidth, top);
+                Drag.apply(panel, pref.collapsed.side === 'left' ? 0 : viewportWidth() - panel.offsetWidth, top);
             } else if (pref.expanded) {
-                const left = Math.max(0, Math.min(pref.expanded.left, window.innerWidth - panel.offsetWidth));
+                const left = Math.max(0, Math.min(pref.expanded.left, viewportWidth() - panel.offsetWidth));
                 const top = clampTop(pref.expanded.top, panel.offsetHeight);
                 Drag.apply(panel, left, top);
             }
@@ -1305,14 +1325,14 @@
                 // 小标签：贴边。优先用记录里的边，没有就按当前横向位置判断
                 const side = pref.collapsed
                     ? pref.collapsed.side
-                    : (rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right');
+                    : (rect.left + rect.width / 2 < viewportWidth() / 2 ? 'left' : 'right');
                 const top = clampTop(rect.top, panel.offsetHeight);
-                Drag.apply(panel, side === 'left' ? 0 : window.innerWidth - panel.offsetWidth, top);
+                Drag.apply(panel, side === 'left' ? 0 : viewportWidth() - panel.offsetWidth, top);
             } else {
                 // 展开态：用记录的位置，没有记录就把当前横向位置钳制进可视区
                 const left = pref.expanded ? pref.expanded.left : rect.left;
                 Drag.apply(panel,
-                    Math.max(0, Math.min(left, window.innerWidth - panel.offsetWidth)),
+                    Math.max(0, Math.min(left, viewportWidth() - panel.offsetWidth)),
                     clampTop(rect.top, panel.offsetHeight));
             }
         },
