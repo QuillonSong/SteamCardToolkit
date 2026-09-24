@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.7.1
+// @version      1.7.2
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -1326,6 +1326,23 @@
 
             // 窗口尺寸变化后原来的坐标可能已经越界，重新钳制一次
             window.addEventListener('resize', () => Panel.relayout());
+
+            // 再挂一个文档尺寸的观察者。
+            //
+            // 为什么 window.resize 不够：库存页刚打开时没有滚动条，物品渲染出来之后
+            // 才出现，这会让 clientWidth 缩掉十几像素 —— 但窗口尺寸没变，
+            // resize 事件根本不会触发。面板若是按"无滚动条时的宽度"定位的，
+            // 就会被滚动条压住一截。ResizeObserver 能捕捉这种内容驱动的尺寸变化。
+            //
+            // 这里改的是面板自身的 style，不会反过来影响 documentElement 的尺寸，
+            // 因此不存在回调自我触发的循环
+            // 观察的是 body 而不是 documentElement：
+            // 滚动条出现时改变的是内容区宽度，这个变化会直接体现在 body 的盒尺寸上；
+            // 而 html 元素的盒尺寸在这种场景下实测不触发回调
+            if (typeof ResizeObserver === 'function') {
+                new ResizeObserver(() => Panel.relayout())
+                    .observe(document.body || document.documentElement);
+            }
         },
 
         template() {
