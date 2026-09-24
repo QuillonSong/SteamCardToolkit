@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.2.1
+// @version      1.3.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -68,9 +68,16 @@
     // ========================================================================
 
     const state = {
-        /** 全量物品条目，元素结构见 InventoryAPI.buildItems */
+        /** 全量物品条目（asset 级），元素结构见 InventoryAPI.buildItems */
         items: [],
-        /** 勾选状态：assetid -> true。用 Map 而非挂在 DOM 上，避免重渲染丢状态 */
+        /**
+         * 按 market_hash_name 合并后的分组（展示用）。
+         * 为什么要多这一层：重复卡各占一行会让列表被同一张卡刷屏，
+         * 合并成"Charger X3"更利于判断该卖什么。
+         * 但上架仍要落到 asset 级 —— Steam 的上架接口是单个 asset 的
+         */
+        groups: [],
+        /** 勾选状态：assetid -> true。用 Set 而非挂在 DOM 上，避免重渲染丢状态 */
         selected: new Set(),
         /** 价格缓存：market_hash_name -> { lowestCents, youReceiveCents, ts } */
         priceCache: new Map(),
@@ -84,7 +91,7 @@
         loaded: false,
         /** 是否有耗时任务在跑，用于互斥，防止用户连点造成并发请求风暴 */
         busy: false,
-        /** 当前筛选：'all' | 'card' | 'foil' */
+        /** 当前筛选：'card' | 'foil' | 'all' | 'dup' */
         filter: 'card',
     };
 
@@ -459,6 +466,39 @@
     // ========================================================================
     // 六、价格 API
     // ========================================================================
+
+    /**
+     * 把 asset 级的物品列表按 market_hash_name 合并成分组。
+     *
+     * 只纳入"可上架的卡牌" —— 表情、背景、宝石不参与批量上架，
+     * 留在列表里只会干扰选择。
+     */
+    function buildGroups(items) {
+        const map = new Map();
+        for (const it of items) {
+            if (!it.marketable || !it.isCard) continue;
+
+            let g = map.get(it.marketHashName);
+            if (!g) {
+                g = {
+                    marketHashName: it.marketHashName,
+                    name: it.name,
+                    type: it.type,
+                    iconUrl: it.iconUrl,
+                    isFoil: it.isFoil,
+                    /** 该分组下的全部 asset 实例。上架时逐个发请求 */
+                    assetids: [],
+                    count: 0,
+                };
+                map.set(it.marketHashName, g);
+            }
+            g.assetids.push(it.assetid);
+        }
+
+        const groups = [...map.values()];
+        for (const g of groups) g.count = g.assetids.length;
+        return groups;
+    }
 
     /**
      * 价格缓存的持久化。
@@ -880,9 +920,12 @@
                     </div>
 
                     <div class="scbs-filters">
-                        <label><input type="radio" name="scbs-filter" value="card" checked> 仅普通卡</label>
-                        <label><input type="radio" name="scbs-filter" value="foil"> 仅闪卡</label>
-                        <label><input type="radio" name="scbs-filter" value="all"> 全部</label>
+                        <select id="scbs-filter-select">
+                            <option value="card" selected>普通卡片</option>
+                            <option value="foil">闪卡</option>
+                            <option value="all">全部</option>
+                            <option value="dup">仅重复</option>
+                        </select>
                     </div>
 
                     <div class="scbs-stats" id="scbs-stats">尚未加载</div>
@@ -948,43 +991,51 @@
 
             // 勾选状态用事件委托，避免为几百个复选框各绑一个监听器
             Panel.root.addEventListener('change', (ev) => {
-                const cb = ev.target.closest('input[data-assetid]');
+                const cb = ev.target.closest('input[data-hash]');
                 if (!cb) return;
-                const assetid = cb.getAttribute('data-assetid');
-                const item = state.items.find((it) => it.assetid === assetid);
-                if (!item) return;
+                const hash = cb.dataset.hash;
+                const group = state.groups.find((g) => g.marketHashName === hash);
+                if (!group) return;
 
                 if (cb.checked) {
-                    state.selected.add(assetid);
+                    // 整组一起选。Steam 的上架接口是单个 asset 的，
+                    // 所以勾一个 X3 分组等于把 3 个 asset 全部标为待上架
+                    for (const id of group.assetids) state.selected.add(id);
                     // 勾选即入队查底价。队列里只有它时是直通处理，
                     // 所以体验是"勾上后约一秒出价"，而不是排在别人后面等
-                    PriceQueue.enqueueMany([item.marketHashName]);
+                    PriceQueue.enqueueMany([hash]);
                     // 必须立刻刷这一行：否则单元格停在"—"，用户完全看不出
-                    // 查询已经开始了，会以为这个功能不存在
-                    Panel.updatePriceCells(item.marketHashName);
+                    // 查询已经开始，会以为这个功能不存在
+                    Panel.updatePriceCells(hash);
                 } else {
-                    state.selected.delete(assetid);
+                    for (const id of group.assetids) state.selected.delete(id);
                     // 不卖了就没必要为它花一次请求。
                     // 已经查到的价格保留 —— 万一又勾回来，不必重查
-                    PriceQueue.remove(item.marketHashName);
+                    PriceQueue.remove(hash);
                 }
                 Panel.updateStats();
             });
 
             Panel.root.addEventListener('change', (ev) => {
-                const radio = ev.target.closest('input[name="scbs-filter"]');
-                if (!radio) return;
-                state.filter = radio.value;
+                const sel = ev.target.closest('#scbs-filter-select');
+                if (!sel) return;
+                state.filter = sel.value;
                 Panel.renderList();
             });
         },
 
-        /** 按当前筛选条件取出要展示的条目 */
-        visibleItems() {
-            const cards = state.items.filter((it) => it.marketable && it.isCard);
-            if (state.filter === 'foil') return cards.filter((it) => it.isFoil);
-            if (state.filter === 'card') return cards.filter((it) => !it.isFoil);
-            return cards;
+        /** 按当前筛选条件取出要展示的分组 */
+        visibleGroups() {
+            const groups = state.groups;
+            if (state.filter === 'foil') return groups.filter((g) => g.isFoil);
+            if (state.filter === 'card') return groups.filter((g) => !g.isFoil);
+            if (state.filter === 'dup') return groups.filter((g) => g.count >= 2);
+            return groups;
+        },
+
+        /** 该分组是否已被完全选中（分组勾选是原子的，不存在选一半的状态） */
+        isGroupSelected(group) {
+            return group.assetids.every((id) => state.selected.has(id));
         },
 
         setStatus(text, kind) {
@@ -997,9 +1048,10 @@
         updateStats() {
             const el = document.getElementById('scbs-stats');
             if (!el) return;
-            const visible = Panel.visibleItems();
-            const selCount = state.selected.size;
-            el.textContent = `展示 ${visible.length} 项 / 已选 ${selCount} 项`;
+            const groups = Panel.visibleGroups();
+            const totalCards = groups.reduce((sum, g) => sum + g.count, 0);
+            // 同时给出"种"和"张"：合并显示后单看条目数会严重低估实际要卖的量
+            el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 已选 ${state.selected.size} 张`;
         },
 
         /**
@@ -1058,8 +1110,8 @@
             const listEl = document.getElementById('scbs-list');
             if (!listEl) return;
 
-            const visible = Panel.visibleItems();
-            if (!visible.length) {
+            const groups = Panel.visibleGroups();
+            if (!groups.length) {
                 listEl.innerHTML = state.loaded
                     ? '<div class="scbs-empty">当前筛选下没有可上架的卡牌</div>'
                     : '<div class="scbs-empty">点击"加载库存"开始</div>';
@@ -1068,23 +1120,27 @@
             }
 
             // 一次性拼字符串再赋值，避免几百次 DOM 插入造成卡顿
-            const html = visible.map((item) => {
-                const checked = state.selected.has(item.assetid) ? 'checked' : '';
-                const icon = item.iconUrl
-                    ? `https://community.cloudflare.steamstatic.com/economy/image/${item.iconUrl}/64fx64f`
+            const html = groups.map((g) => {
+                const checked = Panel.isGroupSelected(g) ? 'checked' : '';
+                const icon = g.iconUrl
+                    ? `https://community.cloudflare.steamstatic.com/economy/image/${g.iconUrl}/64fx64f`
                     : '';
                 // 价格单元格带 data-hash，供 updatePriceCells 做单行刷新时定位
-                const pending = PriceQueue.queued.has(item.marketHashName);
+                const pending = PriceQueue.queued.has(g.marketHashName);
+                // 只有重复的才标数量：单张加个 X1 纯属噪音
+                const countBadge = g.count > 1
+                    ? `<span class="scbs-count">X${g.count}</span>`
+                    : '';
 
                 return `
-                    <div class="scbs-row${item.isFoil ? ' scbs-foil' : ''}">
-                        <input type="checkbox" data-assetid="${escapeHtml(item.assetid)}" ${checked}>
+                    <div class="scbs-row${g.isFoil ? ' scbs-foil' : ''}">
+                        <input type="checkbox" data-hash="${escapeHtml(g.marketHashName)}" ${checked}>
                         ${icon ? `<img class="scbs-icon" src="${escapeHtml(icon)}" loading="lazy" alt="">` : ''}
                         <div class="scbs-info">
-                            <div class="scbs-name" title="${escapeHtml(item.marketHashName)}">${escapeHtml(item.name)}</div>
-                            <div class="scbs-type">${item.isFoil ? '闪卡' : '普通卡'} · ${escapeHtml(item.type)}</div>
+                            <div class="scbs-name" title="${escapeHtml(g.marketHashName)}">${escapeHtml(g.name)}${countBadge}</div>
+                            <div class="scbs-type">${g.isFoil ? '闪卡' : '普通卡'} · ${escapeHtml(g.type)}</div>
                         </div>
-                        <div class="scbs-price" data-hash="${escapeHtml(item.marketHashName)}">${Panel.priceCellHtml(item.marketHashName, pending)}</div>
+                        <div class="scbs-price" data-hash="${escapeHtml(g.marketHashName)}">${Panel.priceCellHtml(g.marketHashName, pending)}</div>
                     </div>
                 `;
             }).join('');
@@ -1098,18 +1154,19 @@
          * @param {boolean|null} value true=全选 false=清空 null=反选
          */
         bulkSelect(value) {
-            const visible = Panel.visibleItems();
-            for (const item of visible) {
-                if (value === null) {
-                    if (state.selected.has(item.assetid)) {
-                        state.selected.delete(item.assetid);
+            for (const g of Panel.visibleGroups()) {
+                // 反选以"整组"为单位判断：否则 X3 的分组会被拆成"选 1 张留 2 张"的
+                // 中间态，而这个界面刻意不支持部分选中
+                const fullySelected = Panel.isGroupSelected(g);
+                for (const id of g.assetids) {
+                    if (value === null) {
+                        if (fullySelected) state.selected.delete(id);
+                        else state.selected.add(id);
+                    } else if (value) {
+                        state.selected.add(id);
                     } else {
-                        state.selected.add(item.assetid);
+                        state.selected.delete(id);
                     }
-                } else if (value) {
-                    state.selected.add(item.assetid);
-                } else {
-                    state.selected.delete(item.assetid);
                 }
             }
             Panel.renderList();
@@ -1128,6 +1185,7 @@
             try {
                 const { assets, descriptions, total } = await InventoryAPI.fetchAll(steamId);
                 state.items = InventoryAPI.buildItems(assets, descriptions);
+                state.groups = buildGroups(state.items);
                 state.loaded = true;
 
                 // 库存可能已变化（比如刚才上架成功的卡已不在库里），
@@ -1202,16 +1260,17 @@
         /** 队列结束（自然跑完或用户停止）后的收尾 */
         onQueueDrained() {
             let priced = 0, limited = 0, failed = 0;
-            for (const it of Panel.visibleItems()) {
-                const p = state.priceCache.get(it.marketHashName);
-                if (p && p.data) { priced++; continue; }
-                const err = state.priceErrors.get(it.marketHashName);
-                if (err === 'limit') limited++;
-                else if (err === 'error') failed++;
+            // 按"张"统计而不是"种"：用户关心的是要发多少笔，一张重复卡算 3 次
+            for (const g of Panel.visibleGroups()) {
+                const p = state.priceCache.get(g.marketHashName);
+                if (p && p.data) { priced += g.count; continue; }
+                const err = state.priceErrors.get(g.marketHashName);
+                if (err === 'limit') limited += g.count;
+                else if (err === 'error') failed += g.count;
             }
 
             // 把"被限流"单独报出来，否则用户会把它当成"这些卡都没人卖"
-            let msg = `查询结束，当前 ${priced} 项有底价`;
+            let msg = `查询结束，当前 ${priced} 张有底价`;
             if (limited) msg += `，${limited} 项被限流未取到（稍后可重试）`;
             if (failed) msg += `，${failed} 项失败`;
             Panel.setStatus(msg, (limited || failed) ? 'error' : 'ok');
@@ -1356,8 +1415,14 @@
             #${CONFIG.PANEL_ID} .scbs-body { padding: 8px 10px; display: flex; flex-direction: column; overflow: hidden; }
             #${CONFIG.PANEL_ID} .scbs-toolbar,
             #${CONFIG.PANEL_ID} .scbs-actions { display: flex; gap: 6px; margin-bottom: 6px; }
-            #${CONFIG.PANEL_ID} .scbs-filters { display: flex; gap: 10px; margin-bottom: 6px; }
-            #${CONFIG.PANEL_ID} .scbs-filters label { cursor: pointer; }
+            #${CONFIG.PANEL_ID} .scbs-filters { margin-bottom: 6px; }
+            #${CONFIG.PANEL_ID} #scbs-filter-select {
+                width: 100%; box-sizing: border-box;
+                background: #2a475e; color: #c7d5e0;
+                border: 1px solid #3d6c8d; border-radius: 2px;
+                padding: 4px 6px; font-size: 12px; cursor: pointer;
+            }
+            #${CONFIG.PANEL_ID} #scbs-filter-select:hover { background: #3d6c8d; color: #fff; }
             #${CONFIG.PANEL_ID} .scbs-btn {
                 background: #2a475e; color: #c7d5e0; border: none; border-radius: 2px;
                 padding: 5px 10px; cursor: pointer; font-size: 12px;
@@ -1393,6 +1458,12 @@
             #${CONFIG.PANEL_ID} .scbs-receive { display: block; color: #8f98a0; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-noprice { color: #6b7680; }
             #${CONFIG.PANEL_ID} .scbs-pending { color: #f0a94c; font-size: 11px; }
+            /* 重复数量徽标（X2 / X3） */
+            #${CONFIG.PANEL_ID} .scbs-count {
+                display: inline-block; margin-left: 5px; padding: 0 5px;
+                background: #3d6c8d; color: #fff; border-radius: 8px;
+                font-size: 10px; line-height: 15px; vertical-align: middle;
+            }
             #${CONFIG.PANEL_ID} .scbs-error { color: #ff7b6b; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-empty { padding: 20px; text-align: center; color: #8f98a0; }
             #${CONFIG.PANEL_ID} .scbs-footer { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
