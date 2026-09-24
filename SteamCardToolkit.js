@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.5.1
+// @version      1.5.2
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -1302,7 +1302,7 @@
                             <option value="all">全部</option>
                         </select>
                         <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
-                            <input type="checkbox" id="scbs-repeat-only"> 仅重复
+                            仅重复 <input type="checkbox" id="scbs-repeat-only">
                         </label>
                     </div>
 
@@ -1939,7 +1939,11 @@
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle {
                 display: flex; align-items: center; gap: 4px;
                 cursor: pointer; color: #8f98a0; white-space: nowrap;
-                flex-shrink: 0; margin-left: auto;
+                flex-shrink: 0;
+                /* 紧接在下拉之后靠左，不再推到行尾；margin-right:auto
+                   保证整行内容左对齐而不是两端分散 */
+                margin-left: 12px;
+                margin-right: auto;
             }
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle:hover { color: #c7d5e0; }
             #${CONFIG.PANEL_ID} .scbs-btn {
