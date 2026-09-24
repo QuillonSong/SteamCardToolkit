@@ -20,7 +20,9 @@ Steam 集换式卡牌批量上架油猴脚本。
 
 ### 方式一：GreasyFork（推荐）
 
-> 待发布
+[**→ 点此安装**](https://greasyfork.org/zh-CN/scripts/597172-steamcardtoolkit)
+
+从油叉安装的用户，更新由油叉托管，会自动收到新版本。
 
 ### 方式二：手动安装
 
