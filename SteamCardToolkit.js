@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.5.2
+// @version      1.6.0
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -99,6 +99,17 @@
          * 注意它和 filter 是两个独立维度 —— 前者管"卖多少"，后者管"看哪些"
          */
         repeatOnly: false,
+        /**
+         * 上架定价规则：
+         *   'lowest'  直接用市场最低价
+         *   'fixed'   最低价 + 固定金额（元）
+         *   'percent' 最低价 × (1 + N%)
+         */
+        priceRule: 'lowest',
+        /** 固定附加金额，单位元。解析后转成分参与计算 */
+        fixedOffsetYuan: '',
+        /** 百分比附加值。填 1 表示 +1% */
+        percentOffset: '',
     };
 
     // ========================================================================
@@ -545,6 +556,35 @@
                 : (cents / Math.pow(10, decimals)).toFixed(decimals);
         },
     };
+
+    /**
+     * 按当前上架规则，把「市场最低价」换算成「我打算挂出的买家支付价」。
+     *
+     * 为什么换算的是买家支付价而不是实收：用户填的附加值（+0.02 元 / +1%）
+     * 针对的是市场上看得见的那个挂牌价，也就是买家支付价。
+     * 实收要等这个值定下来之后再用 Fee.getItemPriceFromTotal 反推。
+     *
+     * @param {number} lowestCents 市场最低价（分）
+     * @returns {number} 目标买家支付价（分）
+     */
+    function applyPriceRule(lowestCents) {
+        if (typeof lowestCents !== 'number' || lowestCents <= 0) return lowestCents;
+
+        if (state.priceRule === 'fixed') {
+            const yuan = parseFloat(state.fixedOffsetYuan);
+            if (!isFinite(yuan) || yuan <= 0) return lowestCents;
+            return lowestCents + Math.round(yuan * 100);
+        }
+
+        if (state.priceRule === 'percent') {
+            const pct = parseFloat(state.percentOffset);
+            if (!isFinite(pct) || pct === 0) return lowestCents;
+            // 填 1 表示 +1%，即 ×1.01
+            return Math.round(lowestCents * (1 + pct / 100));
+        }
+
+        return lowestCents;
+    }
 
     // ========================================================================
     // 五、库存 API
@@ -1271,6 +1311,7 @@
             }
 
             Panel.bindEvents();
+            Panel.syncRuleInput();
             Drag.bind(panel);
             // 位置恢复必须放在折叠 class 应用之后 —— 折叠态的宽度到那时才是最终值
             Drag.restore(panel);
@@ -1304,6 +1345,20 @@
                         <label class="scbs-repeat-toggle" title="每组保留 1 张，只卖多余的；没有重复的卡会从列表隐藏">
                             仅重复 <input type="checkbox" id="scbs-repeat-only">
                         </label>
+                    </div>
+
+                    <div class="scbs-rule-row">
+                        <label for="scbs-rule-select">上架规则：</label>
+                        <select id="scbs-rule-select">
+                            <option value="lowest" selected>底价上架</option>
+                            <option value="fixed">固定附加</option>
+                            <option value="percent">百分比附加</option>
+                        </select>
+                        <span id="scbs-rule-input-wrap" class="scbs-rule-input-wrap" style="display:none">
+                            <input type="number" id="scbs-rule-input" class="scbs-rule-input"
+                                   min="0" step="0.01" inputmode="decimal">
+                            <span id="scbs-rule-unit" class="scbs-rule-unit"></span>
+                        </span>
                     </div>
 
                     <div class="scbs-stats" id="scbs-stats">尚未加载</div>
@@ -1419,6 +1474,28 @@
                 Panel.renderList();
             });
 
+            // 上架规则切换：显示对应输入框，并让列表里的"到手"按新规则重算
+            Panel.root.addEventListener('change', (ev) => {
+                const sel = ev.target.closest('#scbs-rule-select');
+                if (!sel) return;
+                state.priceRule = sel.value;
+                Panel.syncRuleInput();
+                Panel.refreshAllPrices();
+            });
+
+            // 附加值输入。用 input 事件以便边打边看效果，
+            // 但只重刷价格单元格而不是重建整个列表 —— 后者在每次击键时重建 300+ 行会明显卡顿
+            Panel.root.addEventListener('input', (ev) => {
+                const inp = ev.target.closest('#scbs-rule-input');
+                if (!inp) return;
+                if (state.priceRule === 'fixed') {
+                    state.fixedOffsetYuan = inp.value;
+                } else if (state.priceRule === 'percent') {
+                    state.percentOffset = inp.value;
+                }
+                Panel.refreshAllPrices();
+            });
+
             // 「仅重复」开关。
             // 切换时必须按新规则重算已选内容 —— 否则一个已经勾好的 X5 分组，
             // 会在开关打开后仍然选着 5 张，与"只卖 4 张"的预期不符
@@ -1502,6 +1579,59 @@
                              ` · 已选 ${state.selected.size} 张`;
         },
 
+        /** 当前上架规则的可读描述，用于确认框与状态提示 */
+        ruleLabel() {
+            if (state.priceRule === 'fixed') {
+                return `市场最低价 + ${state.fixedOffsetYuan || '0'} 元`;
+            }
+            if (state.priceRule === 'percent') {
+                return `市场最低价 × (1 + ${state.percentOffset || '0'}%)`;
+            }
+            return '等于市场最低价';
+        },
+
+        /** 按当前规则显示/隐藏附加值输入框，并切换单位与占位文案 */
+        syncRuleInput() {
+            const wrap = document.getElementById('scbs-rule-input-wrap');
+            const input = document.getElementById('scbs-rule-input');
+            const unit = document.getElementById('scbs-rule-unit');
+            if (!wrap || !input || !unit) return;
+
+            if (state.priceRule === 'lowest') {
+                wrap.style.display = 'none';
+                return;
+            }
+
+            wrap.style.display = 'flex';
+            if (state.priceRule === 'fixed') {
+                unit.textContent = '元';
+                input.placeholder = '0.02';
+                input.step = '0.01';
+                input.value = state.fixedOffsetYuan;
+            } else {
+                unit.textContent = '%';
+                input.placeholder = '1';
+                input.step = '0.1';
+                input.value = state.percentOffset;
+            }
+        },
+
+        /**
+         * 只重刷价格单元格，不重建列表。
+         *
+         * 切换规则或修改附加值时要让"到手"立刻跟着变，但重建整张列表
+         * （300+ 行 innerHTML）在连续击键时会明显卡顿，所以只改价格那一格。
+         */
+        refreshAllPrices() {
+            const listEl = document.getElementById('scbs-list');
+            if (!listEl) return;
+            const cells = listEl.querySelectorAll('.scbs-price');
+            for (const cell of cells) {
+                const h = cell.dataset.hash;
+                cell.innerHTML = Panel.priceCellHtml(h, PriceQueue.queued.has(h));
+            }
+        },
+
         /**
          * 形态切换或视口变化后重算位置。
          *
@@ -1542,8 +1672,16 @@
             }
             const price = state.priceCache.get(marketHashName);
             if (price && price.data) {
-                return `<span class="scbs-lowest">${escapeHtml(Fee.formatCents(price.data.lowestCents))}</span>` +
-                       `<span class="scbs-receive">到手 ${escapeHtml(Fee.formatCents(price.data.sellerReceivesCents))}</span>`;
+                // 展示的是"按当前上架规则算出的最终挂出价"和对应的到手，
+                // 而不是市场最低价本身 —— 否则切了规则后看到的收益数还是旧口径
+                const lowest = price.data.lowestCents;
+                const target = applyPriceRule(lowest);
+                const receives = Fee.getItemPriceFromTotal(target);
+                const tip = target !== lowest
+                    ? ` title="市场最低价 ${Fee.formatCents(lowest)}，按当前规则上浮到 ${Fee.formatCents(target)}"`
+                    : '';
+                return `<span class="scbs-lowest"${tip}>${escapeHtml(Fee.formatCents(target))}</span>` +
+                       `<span class="scbs-receive">到手 ${escapeHtml(Fee.formatCents(receives))}</span>`;
             }
             if (price) {
                 // 缓存里有这条记录但 data 是 null —— 接口明确答复过"没有挂单"
@@ -1813,7 +1951,13 @@
                     skipped.push({ item, reason: '未查询到价格' });
                     continue;
                 }
-                entries.push({ item, sellerReceivesCents: cached.data.sellerReceivesCents });
+                // 按当前上架规则重算实收：缓存里存的是"按最低价挂出"的实收，
+                // 而用户可能已经切到附加规则了
+                const targetBuyer = applyPriceRule(cached.data.lowestCents);
+                entries.push({
+                    item,
+                    sellerReceivesCents: Fee.getItemPriceFromTotal(targetBuyer),
+                });
             }
 
             if (!entries.length) {
@@ -1829,7 +1973,7 @@
             const confirmMsg =
                 `将发起 ${toSell.length} 笔上架请求` +
                 (entries.length > limit ? `（本次受每批上限 ${limit} 限制，其余下次再发）` : '') +
-                `\n\n定价方式：等于各卡当前市场最低价\n` +
+                `\n\n定价规则：${Panel.ruleLabel()}\n` +
                 `注意：真正生效需要在 Steam 手机 App 里批量确认。\n\n确认继续？`;
             if (!window.confirm(confirmMsg)) return;
 
@@ -1946,6 +2090,32 @@
                 margin-right: auto;
             }
             #${CONFIG.PANEL_ID} .scbs-repeat-toggle:hover { color: #c7d5e0; }
+            /* 上架规则行：结构同筛选行，右侧按规则不同挂出输入框 */
+            #${CONFIG.PANEL_ID} .scbs-rule-row {
+                display: flex; align-items: center; gap: 6px; margin-bottom: 6px;
+            }
+            #${CONFIG.PANEL_ID} .scbs-rule-row > label {
+                color: #8f98a0; white-space: nowrap; flex-shrink: 0;
+            }
+            #${CONFIG.PANEL_ID} #scbs-rule-select {
+                flex: 0 0 auto; width: 96px; box-sizing: border-box;
+                background: #2a475e; color: #c7d5e0;
+                border: 1px solid #3d6c8d; border-radius: 2px;
+                padding: 4px 6px; font-size: 12px; cursor: pointer;
+            }
+            #${CONFIG.PANEL_ID} #scbs-rule-select:hover { background: #3d6c8d; color: #fff; }
+            #${CONFIG.PANEL_ID} .scbs-rule-input-wrap {
+                display: flex; align-items: center; gap: 3px; min-width: 0;
+            }
+            #${CONFIG.PANEL_ID} .scbs-rule-input {
+                width: 72px; box-sizing: border-box;
+                background: #16202d; color: #fff;
+                border: 1px solid #3d6c8d; border-radius: 2px;
+                padding: 4px 6px; font-size: 12px;
+            }
+            #${CONFIG.PANEL_ID} .scbs-rule-input:focus { outline: none; border-color: #1a9fff; }
+            #${CONFIG.PANEL_ID} .scbs-rule-unit { color: #8f98a0; font-size: 11px; white-space: nowrap; }
+            #${CONFIG.PANEL_ID} .scbs-rule-hint { color: #6b7680; font-size: 11px; white-space: nowrap; }
             #${CONFIG.PANEL_ID} .scbs-btn {
                 background: #2a475e; color: #c7d5e0; border: none; border-radius: 2px;
                 padding: 5px 10px; cursor: pointer; font-size: 12px;
