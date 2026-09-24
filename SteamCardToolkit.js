@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.2.0
+// @version      1.2.1
 // @description  API 直读库存与市场价，按市场最低价批量上架集换式卡牌（手机端批量确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -74,6 +74,12 @@
         selected: new Set(),
         /** 价格缓存：market_hash_name -> { lowestCents, youReceiveCents, ts } */
         priceCache: new Map(),
+        /**
+         * 最近一次查询的失败原因：market_hash_name -> 'limit' | 'error'。
+         * 为什么要单独记：被限流和"真没人卖"在界面上必须能区分开，
+         * 否则用户会把限流误读成"这卡不值钱"，据此做出错误的上架决策。
+         */
+        priceErrors: new Map(),
         /** 列表是否已加载 */
         loaded: false,
         /** 是否有耗时任务在跑，用于互斥，防止用户连点造成并发请求风暴 */
@@ -675,12 +681,14 @@
                 //   undefined  请求失败或被限流 —— 结果未知，绝不写入任何缓存
                 let data;
                 let certain = false;
+                let failKind = null;
                 try {
                     data = await PriceAPI.queryLowest(name);
                     certain = true;
                 } catch (e) {
                     data = undefined;
-                    if (e.message === 'RATE_LIMITED') {
+                    failKind = (e.message === 'RATE_LIMITED') ? 'limit' : 'error';
+                    if (failKind === 'limit') {
                         UI.warn(`"${name}" 被限流（429），本轮未取到价格`);
                     } else {
                         UI.warn(`"${name}" 查询失败：${e.message}`);
@@ -691,6 +699,10 @@
                     const entry = { data, ts: Date.now() };
                     state.priceCache.set(name, entry);
                     persist.set(name, entry);
+                    // 这次拿到了结果，之前记录的失败状态作废
+                    state.priceErrors.delete(name);
+                } else {
+                    state.priceErrors.set(name, failKind);
                 }
 
                 // 每查完一条立刻更新对应行的显示。
@@ -947,6 +959,9 @@
                     // 勾选即入队查底价。队列里只有它时是直通处理，
                     // 所以体验是"勾上后约一秒出价"，而不是排在别人后面等
                     PriceQueue.enqueueMany([item.marketHashName]);
+                    // 必须立刻刷这一行：否则单元格停在"—"，用户完全看不出
+                    // 查询已经开始了，会以为这个功能不存在
+                    Panel.updatePriceCells(item.marketHashName);
                 } else {
                     state.selected.delete(assetid);
                     // 不卖了就没必要为它花一次请求。
@@ -1005,6 +1020,15 @@
                 // 缓存里有这条记录但 data 是 null —— 接口明确答复过"没有挂单"
                 return '<span class="scbs-noprice">无挂单</span>';
             }
+            // 查过但失败：必须和"无挂单"、"还没查"区分开，
+            // 否则用户分不清"这卡没人卖"和"请求被拒了"
+            const err = state.priceErrors.get(marketHashName);
+            if (err === 'limit') {
+                return '<span class="scbs-error" title="请求被 Steam 限流，稍后可重试">限流</span>';
+            }
+            if (err === 'error') {
+                return '<span class="scbs-error" title="请求失败">失败</span>';
+            }
             return '<span class="scbs-noprice">—</span>';
         },
 
@@ -1019,7 +1043,10 @@
             const listEl = document.getElementById('scbs-list');
             if (!listEl) return;
             const cells = listEl.querySelectorAll('.scbs-price');
-            const html = Panel.priceCellHtml(marketHashName, false);
+            // pending 状态由队列实时决定，而不是由调用方传 —— 这样同一个方法
+            // 既能用于"刚入队"（显示查询中），也能用于"查完了"（显示结果）
+            const pending = PriceQueue.queued.has(marketHashName);
+            const html = Panel.priceCellHtml(marketHashName, pending);
             for (const cell of cells) {
                 if (cell.dataset.hash === marketHashName) {
                     cell.innerHTML = html;
@@ -1174,11 +1201,20 @@
 
         /** 队列结束（自然跑完或用户停止）后的收尾 */
         onQueueDrained() {
-            const priced = Panel.visibleItems().filter((it) => {
+            let priced = 0, limited = 0, failed = 0;
+            for (const it of Panel.visibleItems()) {
                 const p = state.priceCache.get(it.marketHashName);
-                return p && p.data;
-            }).length;
-            Panel.setStatus(`查询结束，当前 ${priced} 项有底价`, 'ok');
+                if (p && p.data) { priced++; continue; }
+                const err = state.priceErrors.get(it.marketHashName);
+                if (err === 'limit') limited++;
+                else if (err === 'error') failed++;
+            }
+
+            // 把"被限流"单独报出来，否则用户会把它当成"这些卡都没人卖"
+            let msg = `查询结束，当前 ${priced} 项有底价`;
+            if (limited) msg += `，${limited} 项被限流未取到（稍后可重试）`;
+            if (failed) msg += `，${failed} 项失败`;
+            Panel.setStatus(msg, (limited || failed) ? 'error' : 'ok');
             Panel.updatePriceButton();
         },
 
@@ -1357,6 +1393,7 @@
             #${CONFIG.PANEL_ID} .scbs-receive { display: block; color: #8f98a0; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-noprice { color: #6b7680; }
             #${CONFIG.PANEL_ID} .scbs-pending { color: #f0a94c; font-size: 11px; }
+            #${CONFIG.PANEL_ID} .scbs-error { color: #ff7b6b; font-size: 11px; }
             #${CONFIG.PANEL_ID} .scbs-empty { padding: 20px; text-align: center; color: #8f98a0; }
             #${CONFIG.PANEL_ID} .scbs-footer { margin-top: 8px; display: flex; align-items: center; gap: 8px; }
             #${CONFIG.PANEL_ID} .scbs-status { flex: 1; color: #8f98a0; word-break: break-all; }
