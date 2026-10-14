@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SteamCardToolkit
 // @namespace    https://github.com/QuillonSong/SteamCardToolkit
-// @version      1.7.3
+// @version      1.7.4
 // @description  API 直读库存与市场价，按底价 / 固定附加 / 百分比附加批量上架集换式卡牌，可只卖重复卡（生效需手机端确认）
 // @author       Quillon
 // @license      GPL-3.0-only
@@ -109,13 +109,13 @@
         /**
          * 上架定价规则：
          *   'lowest'  直接用市场最低价
-         *   'fixed'   最低价 + 固定金额（元）
-         *   'percent' 最低价 × (1 + N%)
+         *   'fixed'   最低价 + 固定金额（元），负值即降价
+         *   'percent' 最低价 × (1 + N%)，负值即降价
          */
         priceRule: 'lowest',
-        /** 固定附加金额，单位元。解析后转成分参与计算 */
+        /** 固定附加金额，单位元。解析后转成分参与计算。允许负数（降价挂出） */
         fixedOffsetYuan: '',
-        /** 百分比附加值。填 1 表示 +1% */
+        /** 百分比附加值。填 1 表示 +1%，填 -5 表示降价 5% */
         percentOffset: '',
     };
 
@@ -384,6 +384,10 @@
     //   - 用页面函数能保证与 Steam 当前规则完全一致（万一规则调整）；
     //   - 自实现版本是兜底，防止页面函数被改名/移除导致脚本整体失效。
     //
+    // 买家支付价下限的惰性缓存。该值在一次会话内恒定（钱包币种不会中途变），
+    // 而 refreshAllPrices 每次击键都要对 300+ 个价格单元格重算，不宜反复走页面函数。
+    let minTotalCache = null;
+
     const Fee = {
         /** 取钱包信息。动态获取而非缓存引用，避免页面状态切换后引用失效 */
         wallet() {
@@ -403,11 +407,25 @@
             };
         },
 
-        /** 钱包最低价（分）。低于此值的挂单不合法 */
+        /** 实收最低价（分）。挂单时卖家至少能拿到这么多，低于此值的挂单不合法 */
         minimum() {
             const w = Fee.wallet() || {};
             const n = parseInt(w.wallet_market_minimum, 10);
             return isNaN(n) ? 1 : n;
+        },
+
+        /**
+         * 挂牌买家支付价下限（分）：把「实收下限」换算成对应的买家支付价。
+         *
+         * 为什么不能直接用 minimum()：wallet_market_minimum 是**实收**下限
+         * （国区 0.07 元），而列表展示、与市场最低价比较用的都是**买家支付价**。
+         * 后者下限是前者叠加最低手续费后的结果（国区 0.21 元）——
+         * 换算必须交给页面自身的 GetTotalWithFees，不要自己拼费率，
+         * 否则低价区的手续费取整规则（存在最低手续费兜底）会对不上。
+         */
+        minimumTotal() {
+            if (minTotalCache == null) minTotalCache = Fee.getTotalWithFees(Fee.minimum());
+            return minTotalCache;
         },
 
         /** 货币最小增量 */
@@ -571,26 +589,31 @@
      * 针对的是市场上看得见的那个挂牌价，也就是买家支付价。
      * 实收要等这个值定下来之后再用 Fee.getItemPriceFromTotal 反推。
      *
+     * 附加值允许为负：用户想压低价格抢成交时直接填 -0.02 / -5 即可。
+     * 注意负值不能被当成"没填"而跳过，判定条件必须是 === 0 而不是 <= 0。
+     *
      * @param {number} lowestCents 市场最低价（分）
      * @returns {number} 目标买家支付价（分）
      */
     function applyPriceRule(lowestCents) {
         if (typeof lowestCents !== 'number' || lowestCents <= 0) return lowestCents;
 
+        let target = lowestCents;
+
         if (state.priceRule === 'fixed') {
             const yuan = parseFloat(state.fixedOffsetYuan);
-            if (!isFinite(yuan) || yuan <= 0) return lowestCents;
-            return lowestCents + Math.round(yuan * 100);
-        }
-
-        if (state.priceRule === 'percent') {
+            // 0 或非法输入视为不调价；负值合法，走降价
+            if (isFinite(yuan) && yuan !== 0) target = lowestCents + Math.round(yuan * 100);
+        } else if (state.priceRule === 'percent') {
             const pct = parseFloat(state.percentOffset);
-            if (!isFinite(pct) || pct === 0) return lowestCents;
-            // 填 1 表示 +1%，即 ×1.01
-            return Math.round(lowestCents * (1 + pct / 100));
+            // 填 1 表示 +1%（×1.01），填 -5 表示降价 5%
+            if (isFinite(pct) && pct !== 0) target = Math.round(lowestCents * (1 + pct / 100));
         }
 
-        return lowestCents;
+        // 兜底钳制：无论三种规则中的哪一种（含"底价上架"遇到异常偏低的行情数据），
+        // 目标价都不得低于挂牌买家价下限（国区 0.21 元，对应到手 0.07 元）。
+        // 低于此值 Steam 直接拒单，列表里更不该显示这种挂不出去的假价格。
+        return Math.max(target, Fee.minimumTotal());
     }
 
     // ========================================================================
@@ -1085,6 +1108,10 @@
                 }
 
                 Panel.reportQueue();
+                // 每完成一个任务就重算一次顶部统计，让"到手总额"随价格流式到达逐步补齐。
+                // 放在任务粒度而不是每张卡：单个任务可能含几十个卡名，
+                // 逐张刷新会把"遍历全表求和"这个动作累积成 O(n²)
+                Panel.updateStats();
 
                 // 分批落盘，避免每查一条就把整张缓存表序列化一遍
                 if (persist.size >= CONFIG.PRICE_CACHE_FLUSH_EVERY) {
@@ -1385,7 +1412,8 @@
                         </select>
                         <span id="scbs-rule-input-wrap" class="scbs-rule-input-wrap" style="display:none">
                             <input type="number" id="scbs-rule-input" class="scbs-rule-input"
-                                   min="0" step="0.01" inputmode="decimal">
+                                   step="0.01" inputmode="decimal"
+                                   title="填正数加价，填负数降价">
                             <span id="scbs-rule-unit" class="scbs-rule-unit"></span>
                         </span>
                     </div>
@@ -1617,6 +1645,37 @@
             el.className = 'scbs-status' + (kind ? ' scbs-' + kind : '');
         },
 
+        /**
+         * 已选卡牌的预计到手总额（分），以及其中"取不到价"的张数。
+         *
+         * 口径必须与「批量上架」完全一致：到手 = 按当前规则挂出后的卖家实收（已扣手续费），
+         * 且没有价格缓存的卡会被上架流程跳过，因此也不计入金额。
+         * 两边算法必须是同一个，否则面板上显示的总额会和最终到账对不上。
+         *
+         * @returns {{cents: number, unpriced: number}}
+         */
+        selectedReceives() {
+            // 先按卡名归并计数：同一张卡的多个副本共用一个价格，
+            // 逐个 asset 重算会把 applyPriceRule / getItemPriceFromTotal 的迭代白跑 N 遍
+            const countByHash = new Map();
+            for (const item of state.items) {
+                if (!state.selected.has(item.assetid)) continue;
+                countByHash.set(item.marketHashName, (countByHash.get(item.marketHashName) || 0) + 1);
+            }
+
+            let cents = 0;
+            let unpriced = 0;
+            for (const [hash, n] of countByHash) {
+                const cached = state.priceCache.get(hash);
+                if (!cached || !cached.data) {
+                    unpriced += n;
+                    continue;
+                }
+                cents += Fee.getItemPriceFromTotal(applyPriceRule(cached.data.lowestCents)) * n;
+            }
+            return { cents, unpriced };
+        },
+
         updateStats() {
             const el = document.getElementById('scbs-stats');
             if (!el) return;
@@ -1627,8 +1686,18 @@
             const sellable = groups.reduce((sum, g) => sum + Panel.targetAssetids(g).length, 0);
             // 三种口径都要给：种=多少类卡，张=库存共多少张，
             // 可卖=按当前规则实际会上架多少张（开着「仅重复」会比总数少）
-            el.textContent = `展示 ${groups.length} 种 / ${totalCards} 张 · 可卖 ${sellable} 张` +
-                             ` · 已选 ${state.selected.size} 张`;
+            let text = `展示 ${groups.length} 种 / ${totalCards} 张 · 可卖 ${sellable} 张` +
+                       ` · 已选 ${state.selected.size} 张`;
+
+            // 没勾选任何卡时不算总额：既省掉一次全量遍历，也避免显示一个恒为 0 的"到手"
+            if (state.selected.size) {
+                const { cents, unpriced } = Panel.selectedReceives();
+                text += ` · 到手 ${Fee.formatCents(cents)}`;
+                // 取不到价的卡会被上架流程跳过，不声明的话用户会以为总额漏算了
+                if (unpriced) text += `（${unpriced} 张未取到价）`;
+            }
+
+            el.textContent = text;
         },
 
         /** 仅在勾选「仅重复」时显示保留数量输入框 */
@@ -1665,11 +1734,17 @@
 
         /** 当前上架规则的可读描述，用于确认框与状态提示 */
         ruleLabel() {
+            // 用实际数值判定，而不是看输入框字符串 ——
+            // 空串 / "-" / "0" 都应回落到"等于市场最低价"，避免确认框里出现 "+ -0 元" 这种废话
             if (state.priceRule === 'fixed') {
-                return `市场最低价 + ${state.fixedOffsetYuan || '0'} 元`;
+                const yuan = parseFloat(state.fixedOffsetYuan);
+                if (!isFinite(yuan) || yuan === 0) return '等于市场最低价';
+                return `市场最低价 ${yuan > 0 ? '+' : '-'} ${Math.abs(yuan)} 元`;
             }
             if (state.priceRule === 'percent') {
-                return `市场最低价 × (1 + ${state.percentOffset || '0'}%)`;
+                const pct = parseFloat(state.percentOffset);
+                if (!isFinite(pct) || pct === 0) return '等于市场最低价';
+                return `市场最低价 ${pct > 0 ? '+' : '-'} ${Math.abs(pct)}%`;
             }
             return '等于市场最低价';
         },
@@ -1714,6 +1789,9 @@
                 const h = cell.dataset.hash;
                 cell.innerHTML = Panel.priceCellHtml(h, PriceQueue.queued.has(h));
             }
+            // 顶部统计里的"到手总额"同样依赖当前规则与附加值，
+            // 不跟着重算就会停在切规则之前的旧数字上
+            Panel.updateStats();
         },
 
         /**
@@ -1762,7 +1840,7 @@
                 const target = applyPriceRule(lowest);
                 const receives = Fee.getItemPriceFromTotal(target);
                 const tip = target !== lowest
-                    ? ` title="市场最低价 ${Fee.formatCents(lowest)}，按当前规则上浮到 ${Fee.formatCents(target)}"`
+                    ? ` title="市场最低价 ${Fee.formatCents(lowest)}，按当前规则调价为 ${Fee.formatCents(target)}"`
                     : '';
                 return `<span class="scbs-lowest"${tip}>${escapeHtml(Fee.formatCents(target))}</span>` +
                        `<span class="scbs-receive">到手 ${escapeHtml(Fee.formatCents(receives))}</span>`;
